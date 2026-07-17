@@ -1,0 +1,627 @@
+require("dotenv").config();
+const express = require("express");
+require("express-async-errors"); // forwards rejected promises from async route handlers to next(err) instead of crashing the process
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const { Pool } = require("pg");
+const ExcelJS = require("exceljs");
+const PptxGenJS = require("pptxgenjs");
+
+const app = express();
+app.use(cors({ origin: process.env.CLIENT_URL || "*" }));
+app.use(express.json());
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret";
+
+/* ============================================================
+   Bonus policy helpers (Incentive Policy FY'27)
+   ============================================================ */
+function bonusFor(achievement, baseRate) {
+  if (achievement < 0.9) return 0;
+  if (achievement < 1.0) return baseRate * 0.6 * achievement;
+  if (achievement <= 1.25) return baseRate * achievement;
+  return baseRate * 1.25;
+}
+function tierLabel(achievement) {
+  if (achievement < 0.9) return "Нет бонуса (<90%)";
+  if (achievement < 1.0) return "60% ставки (90-99.99%)";
+  if (achievement <= 1.25) return "100% ставки (100-124.99%)";
+  return "Потолок 125%";
+}
+const FFE_LABELS = {
+  doctor_coverage_a: "Doctor coverage — Категория A",
+  doctor_coverage_b: "Doctor coverage — Категория B",
+  core_doctor_coverage_a: "Core doctor coverage — Категория A",
+  core_doctor_coverage_b: "Core doctor coverage — Категория B",
+  doctor_call_coverage_a: "Doctor call coverage — Категория A",
+  doctor_call_coverage_b: "Doctor call coverage — Категория B",
+  core_call_coverage_a: "Core call coverage — Категория A",
+  core_call_coverage_b: "Core call coverage — Категория B",
+  pharmacy_coverage_a: "Pharmacy coverage — Категория A",
+  pharmacy_coverage_b: "Pharmacy coverage — Категория B",
+};
+const FFE_GATE = 0.85; // minimum overall FFE score required for incentive eligibility
+
+/* ============================================================
+   Auth middleware
+   ============================================================ */
+function auth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "No token" });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) return res.status(403).json({ error: "Forbidden" });
+    next();
+  };
+}
+
+/* ============================================================
+   Access-control helper: can this user see this report?
+   ============================================================ */
+async function canAccessReport(user, report) {
+  if (user.role === "master") return true;
+  if (user.role === "mp") return report.mp_id === user.id;
+  if (user.role === "rm") {
+    const r = await pool.query("select rm_id from users where id = $1", [report.mp_id]);
+    return r.rows[0] && r.rows[0].rm_id === user.id;
+  }
+  return false;
+}
+
+/* ============================================================
+   AUTH ROUTES
+   ============================================================ */
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "email и пароль обязательны" });
+  const { rows } = await pool.query("select * from users where email = $1 and is_active = true", [email.toLowerCase()]);
+  const user = rows[0];
+  if (!user) return res.status(401).json({ error: "Неверный email или пароль" });
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) return res.status(401).json({ error: "Неверный email или пароль" });
+  const token = jwt.sign(
+    { id: user.id, role: user.role, full_name: user.full_name, email: user.email },
+    JWT_SECRET,
+    { expiresIn: "12h" }
+  );
+  res.json({
+    token,
+    user: { id: user.id, email: user.email, full_name: user.full_name, role: user.role, territory: user.territory, rm_id: user.rm_id },
+  });
+});
+
+app.get("/api/auth/me", auth, async (req, res) => {
+  const { rows } = await pool.query("select id, email, full_name, role, territory, rm_id from users where id = $1", [req.user.id]);
+  if (!rows[0]) return res.status(404).json({ error: "Not found" });
+  res.json(rows[0]);
+});
+
+/* ============================================================
+   USERS — master creates RM and MP accounts
+   ============================================================ */
+// list RMs (used to populate "attach to RM" dropdown when creating an MP)
+app.get("/api/users/rms", auth, requireRole("master"), async (req, res) => {
+  const { rows } = await pool.query("select id, full_name, email, territory from users where role = 'rm' and is_active = true order by full_name");
+  res.json(rows);
+});
+
+// list users (master: everyone; rm: their own MPs)
+app.get("/api/users", auth, async (req, res) => {
+  if (req.user.role === "master") {
+    const { rows } = await pool.query(
+      `select u.id, u.email, u.full_name, u.role, u.territory, u.rm_id, u.is_active, rm.full_name as rm_name
+       from users u left join users rm on rm.id = u.rm_id
+       order by u.role, u.full_name`
+    );
+    return res.json(rows);
+  }
+  if (req.user.role === "rm") {
+    const { rows } = await pool.query(
+      "select id, email, full_name, role, territory, is_active from users where rm_id = $1 order by full_name",
+      [req.user.id]
+    );
+    return res.json(rows);
+  }
+  return res.status(403).json({ error: "Forbidden" });
+});
+
+app.post("/api/users", auth, requireRole("master"), async (req, res) => {
+  const { email, password, full_name, role, rm_id, territory } = req.body;
+  if (!email || !password || !full_name || !role) return res.status(400).json({ error: "Заполните все обязательные поля" });
+  if (!["rm", "mp"].includes(role)) return res.status(400).json({ error: "Недопустимая роль" });
+  if (role === "mp" && !rm_id) return res.status(400).json({ error: "Для медпреда обязательно нужно указать РМ" });
+  const hash = await bcrypt.hash(password, 10);
+  try {
+    const { rows } = await pool.query(
+      `insert into users (email, password_hash, full_name, role, rm_id, territory)
+       values ($1,$2,$3,$4,$5,$6) returning id, email, full_name, role, rm_id, territory`,
+      [email.toLowerCase(), hash, full_name, role, role === "mp" ? rm_id : null, territory || null]
+    );
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === "23505") return res.status(409).json({ error: "Такой email уже зарегистрирован" });
+    console.error(e);
+    res.status(500).json({ error: "Ошибка создания пользователя" });
+  }
+});
+
+app.patch("/api/users/:id", auth, requireRole("master"), async (req, res) => {
+  const { is_active, territory, rm_id, full_name } = req.body;
+  const fields = [];
+  const values = [];
+  let i = 1;
+  for (const [k, v] of Object.entries({ is_active, territory, rm_id, full_name })) {
+    if (v !== undefined) {
+      fields.push(`${k} = $${i++}`);
+      values.push(v);
+    }
+  }
+  if (!fields.length) return res.status(400).json({ error: "Нет полей для обновления" });
+  values.push(req.params.id);
+  await pool.query(`update users set ${fields.join(", ")} where id = $${i}`, values);
+  res.json({ ok: true });
+});
+
+/* ============================================================
+   PRODUCTS
+   ============================================================ */
+app.get("/api/products", auth, async (req, res) => {
+  const { rows } = await pool.query("select * from products order by sort_order");
+  res.json(rows);
+});
+
+/* ============================================================
+   REPORTS — list (role-scoped)
+   ============================================================ */
+app.get("/api/reports", auth, async (req, res) => {
+  const { year, month } = req.query;
+  let where = [];
+  let values = [];
+  let i = 1;
+
+  if (req.user.role === "mp") {
+    where.push(`r.mp_id = $${i++}`);
+    values.push(req.user.id);
+  } else if (req.user.role === "rm") {
+    where.push(`mp.rm_id = $${i++}`);
+    values.push(req.user.id);
+  } // master: no restriction
+
+  if (year) { where.push(`r.period_year = $${i++}`); values.push(year); }
+  if (month) { where.push(`r.period_month = $${i++}`); values.push(month); }
+
+  const sql = `
+    select r.*, mp.full_name as mp_name, mp.territory as mp_territory, mp.rm_id,
+           rm.full_name as rm_name
+    from reports r
+    join users mp on mp.id = r.mp_id
+    left join users rm on rm.id = mp.rm_id
+    ${where.length ? "where " + where.join(" and ") : ""}
+    order by r.period_year desc, r.period_month desc, mp.full_name`;
+  const { rows } = await pool.query(sql, values);
+  res.json(rows);
+});
+
+// get-or-create current MP's report for a period
+app.post("/api/reports", auth, requireRole("mp"), async (req, res) => {
+  const { period_year, period_month } = req.body;
+  if (!period_year || !period_month) return res.status(400).json({ error: "Укажите год и месяц" });
+  let { rows } = await pool.query(
+    "select * from reports where mp_id=$1 and period_year=$2 and period_month=$3",
+    [req.user.id, period_year, period_month]
+  );
+  if (rows[0]) return res.json(rows[0]);
+
+  const created = await pool.query(
+    "insert into reports (mp_id, period_year, period_month) values ($1,$2,$3) returning *",
+    [req.user.id, period_year, period_month]
+  );
+  const report = created.rows[0];
+
+  // seed empty FSS rows for every product
+  const products = await pool.query("select id from products order by sort_order");
+  for (const p of products.rows) {
+    await pool.query(
+      "insert into report_fss (report_id, product_id, target_qty, actual_qty) values ($1,$2,0,0)",
+      [report.id, p.id]
+    );
+  }
+  // seed empty FFE rows
+  for (const key of Object.keys(FFE_LABELS)) {
+    await pool.query(
+      "insert into report_ffe (report_id, metric_key, master_list_count, approved_count, achieved_count) values ($1,$2,0,0,0)",
+      [report.id, key]
+    );
+  }
+  await pool.query(
+    "insert into report_field_days (report_id) values ($1)",
+    [report.id]
+  );
+  res.json(report);
+});
+
+/* ---- report detail ---- */
+app.get("/api/reports/:id", auth, async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id = $1", [rid]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Отчёт не найден" });
+  if (!(await canAccessReport(req.user, report))) return res.status(403).json({ error: "Forbidden" });
+
+  const mpRes = await pool.query("select id, full_name, territory, rm_id from users where id=$1", [report.mp_id]);
+  const fssRes = await pool.query(
+    `select f.*, p.name as product_name, p.nrv_usd
+     from report_fss f join products p on p.id = f.product_id
+     where f.report_id = $1 order by p.sort_order`, [rid]
+  );
+  const ffeRes = await pool.query("select * from report_ffe where report_id=$1", [rid]);
+  const fieldDaysRes = await pool.query("select * from report_field_days where report_id=$1", [rid]);
+  const apRes = await pool.query("select * from report_action_plan where report_id=$1 order by sort_order, id", [rid]);
+  const commentsRes = await pool.query(
+    `select c.*, u.full_name as author_name from report_comments c
+     join users u on u.id = c.author_id where c.report_id=$1 order by c.created_at`, [rid]
+  );
+  const logRes = await pool.query(
+    `select l.*, u.full_name as actor_name from report_status_log l
+     join users u on u.id = l.actor_id where l.report_id=$1 order by l.created_at`, [rid]
+  );
+
+  // ---- computed FSS totals ----
+  let targetUsd = 0, actualUsd = 0;
+  const fssItems = fssRes.rows.map((row) => {
+    const t = Number(row.target_qty) * Number(row.nrv_usd);
+    const a = Number(row.actual_qty) * Number(row.nrv_usd);
+    targetUsd += t; actualUsd += a;
+    return { ...row, target_usd: t, actual_usd: a };
+  });
+  const achievement = targetUsd === 0 ? 0 : actualUsd / targetUsd;
+  const bonusUzs = bonusFor(achievement, Number(report.base_rate_uzs));
+
+  // ---- computed FFE score ----
+  const ffeItems = ffeRes.rows.map((row) => {
+    const denom = row.approved_count > 0 ? row.approved_count : row.master_list_count;
+    const pct = denom > 0 ? row.achieved_count / denom : 0;
+    return { ...row, label: FFE_LABELS[row.metric_key], percent: pct };
+  });
+  const ffeScore = ffeItems.length ? ffeItems.reduce((s, x) => s + x.percent, 0) / ffeItems.length : 0;
+  const ffeGatePassed = ffeScore >= FFE_GATE;
+
+  res.json({
+    report,
+    mp: mpRes.rows[0],
+    fss: { items: fssItems, target_usd: targetUsd, actual_usd: actualUsd, achievement, bonus_uzs: bonusUzs, bonus_usd: bonusUzs / Number(report.fx_rate), tier_label: tierLabel(achievement) },
+    ffe: { items: ffeItems, score: ffeScore, gate_passed: ffeGatePassed, gate_threshold: FFE_GATE },
+    field_days: fieldDaysRes.rows[0],
+    action_plan: apRes.rows,
+    comments: commentsRes.rows,
+    status_log: logRes.rows,
+  });
+});
+
+/* ---- MP updates: FSS / FFE / action plan / settings (only draft/returned) ---- */
+function assertEditable(report, res) {
+  if (!["draft", "returned"].includes(report.status)) {
+    res.status(409).json({ error: "Отчёт уже отправлен на рассмотрение — редактирование недоступно" });
+    return false;
+  }
+  return true;
+}
+
+app.put("/api/reports/:id/fss", auth, requireRole("mp"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1 and mp_id=$2", [rid, req.user.id]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!assertEditable(report, res)) return;
+  const { items } = req.body; // [{product_id, target_qty, actual_qty}]
+  for (const it of items) {
+    await pool.query(
+      "update report_fss set target_qty=$1, actual_qty=$2 where report_id=$3 and product_id=$4",
+      [it.target_qty || 0, it.actual_qty || 0, rid, it.product_id]
+    );
+  }
+  await pool.query("update reports set updated_at = now() where id=$1", [rid]);
+  res.json({ ok: true });
+});
+
+app.put("/api/reports/:id/ffe", auth, requireRole("mp"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1 and mp_id=$2", [rid, req.user.id]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!assertEditable(report, res)) return;
+  const { items, field_days } = req.body;
+  for (const it of items || []) {
+    await pool.query(
+      "update report_ffe set master_list_count=$1, approved_count=$2, achieved_count=$3 where report_id=$4 and metric_key=$5",
+      [it.master_list_count || 0, it.approved_count || 0, it.achieved_count || 0, rid, it.metric_key]
+    );
+  }
+  if (field_days) {
+    await pool.query(
+      `update report_field_days set total_days=$1, non_working_days=$2, public_holidays=$3, training_days=$4, leave_days=$5, field_days=$6
+       where report_id=$7`,
+      [field_days.total_days, field_days.non_working_days, field_days.public_holidays, field_days.training_days, field_days.leave_days, field_days.field_days, rid]
+    );
+  }
+  await pool.query("update reports set updated_at = now() where id=$1", [rid]);
+  res.json({ ok: true });
+});
+
+app.put("/api/reports/:id/action-plan", auth, requireRole("mp"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1 and mp_id=$2", [rid, req.user.id]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!assertEditable(report, res)) return;
+  const { items } = req.body; // [{id?, product_name, goal, action_text, control_date, completion_date}]
+  await pool.query("delete from report_action_plan where report_id=$1", [rid]);
+  let order = 0;
+  for (const it of items || []) {
+    await pool.query(
+      `insert into report_action_plan (report_id, product_name, goal, action_text, control_date, completion_date, sort_order)
+       values ($1,$2,$3,$4,$5,$6,$7)`,
+      [rid, it.product_name || "", it.goal || "", it.action_text || "", it.control_date || null, it.completion_date || null, order++]
+    );
+  }
+  await pool.query("update reports set updated_at = now() where id=$1", [rid]);
+  res.json({ ok: true });
+});
+
+app.put("/api/reports/:id/settings", auth, async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1", [rid]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!(await canAccessReport(req.user, report))) return res.status(403).json({ error: "Forbidden" });
+  if (req.user.role === "mp" && !assertEditable(report, res)) return;
+  const { base_rate_uzs, fx_rate } = req.body;
+  await pool.query("update reports set base_rate_uzs=coalesce($1,base_rate_uzs), fx_rate=coalesce($2,fx_rate) where id=$3", [base_rate_uzs, fx_rate, rid]);
+  res.json({ ok: true });
+});
+
+/* ---- workflow transitions ---- */
+async function logTransition(rid, from, to, actorId, note) {
+  await pool.query(
+    "insert into report_status_log (report_id, from_status, to_status, actor_id, note) values ($1,$2,$3,$4,$5)",
+    [rid, from, to, actorId, note || null]
+  );
+}
+
+app.post("/api/reports/:id/submit", auth, requireRole("mp"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1 and mp_id=$2", [rid, req.user.id]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!["draft", "returned"].includes(report.status)) return res.status(409).json({ error: "Отчёт уже отправлен" });
+  await pool.query("update reports set status='submitted', submitted_at=now() where id=$1", [rid]);
+  await logTransition(rid, report.status, "submitted", req.user.id);
+  res.json({ ok: true });
+});
+
+app.post("/api/reports/:id/return", auth, requireRole("rm"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1", [rid]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!(await canAccessReport(req.user, report))) return res.status(403).json({ error: "Forbidden" });
+  if (report.status !== "submitted") return res.status(409).json({ error: "Отчёт не находится на рассмотрении" });
+  await pool.query("update reports set status='returned' where id=$1", [rid]);
+  if (req.body.comment_text) {
+    await pool.query(
+      "insert into report_comments (report_id, section, author_id, author_role, comment_text) values ($1,'general',$2,$3,$4)",
+      [rid, req.user.id, req.user.role, req.body.comment_text]
+    );
+  }
+  await logTransition(rid, "submitted", "returned", req.user.id, req.body.comment_text);
+  res.json({ ok: true });
+});
+
+app.post("/api/reports/:id/approve-rm", auth, requireRole("rm"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1", [rid]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!(await canAccessReport(req.user, report))) return res.status(403).json({ error: "Forbidden" });
+  if (report.status !== "submitted") return res.status(409).json({ error: "Отчёт не находится на рассмотрении" });
+  await pool.query("update reports set status='approved', rm_reviewed_at=now() where id=$1", [rid]);
+  await logTransition(rid, "submitted", "approved", req.user.id, req.body.comment_text);
+  if (req.body.comment_text) {
+    await pool.query(
+      "insert into report_comments (report_id, section, author_id, author_role, comment_text) values ($1,'general',$2,$3,$4)",
+      [rid, req.user.id, req.user.role, req.body.comment_text]
+    );
+  }
+  res.json({ ok: true });
+});
+
+app.post("/api/reports/:id/comment", auth, requireRole("rm", "master"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1", [rid]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!(await canAccessReport(req.user, report))) return res.status(403).json({ error: "Forbidden" });
+  const { section, item_ref, comment_text } = req.body;
+  if (!comment_text) return res.status(400).json({ error: "Пустой комментарий" });
+  const { rows } = await pool.query(
+    `insert into report_comments (report_id, section, item_ref, author_id, author_role, comment_text)
+     values ($1,$2,$3,$4,$5,$6) returning *`,
+    [rid, section || "general", item_ref || null, req.user.id, req.user.role, comment_text]
+  );
+  res.json(rows[0]);
+});
+
+/* ============================================================
+   EXPORTS — available once status = 'approved'
+   ============================================================ */
+async function loadFullReport(rid) {
+  const rRes = await pool.query("select * from reports where id=$1", [rid]);
+  const report = rRes.rows[0];
+  if (!report) return null;
+  const mpRes = await pool.query("select id, full_name, territory, rm_id from users where id=$1", [report.mp_id]);
+  const rmRes = mpRes.rows[0]?.rm_id
+    ? await pool.query("select full_name from users where id=$1", [mpRes.rows[0].rm_id])
+    : { rows: [] };
+  const fssRes = await pool.query(
+    `select f.*, p.name as product_name, p.nrv_usd from report_fss f
+     join products p on p.id=f.product_id where f.report_id=$1 order by p.sort_order`, [rid]);
+  const ffeRes = await pool.query("select * from report_ffe where report_id=$1", [rid]);
+  const apRes = await pool.query("select * from report_action_plan where report_id=$1 order by sort_order,id", [rid]);
+
+  let targetUsd = 0, actualUsd = 0;
+  const fssItems = fssRes.rows.map((r) => {
+    const t = Number(r.target_qty) * Number(r.nrv_usd);
+    const a = Number(r.actual_qty) * Number(r.nrv_usd);
+    targetUsd += t; actualUsd += a;
+    return { ...r, target_usd: t, actual_usd: a };
+  });
+  const achievement = targetUsd === 0 ? 0 : actualUsd / targetUsd;
+  const bonusUzs = bonusFor(achievement, Number(report.base_rate_uzs));
+
+  const ffeItems = ffeRes.rows.map((r) => {
+    const denom = r.approved_count > 0 ? r.approved_count : r.master_list_count;
+    const pct = denom > 0 ? r.achieved_count / denom : 0;
+    return { ...r, label: FFE_LABELS[r.metric_key], percent: pct };
+  });
+  const ffeScore = ffeItems.length ? ffeItems.reduce((s, x) => s + x.percent, 0) / ffeItems.length : 0;
+
+  return {
+    report, mp: mpRes.rows[0], rm_name: rmRes.rows[0]?.full_name || "—",
+    fssItems, targetUsd, actualUsd, achievement, bonusUzs, bonusUsd: bonusUzs / Number(report.fx_rate),
+    ffeItems, ffeScore, actionPlan: apRes.rows,
+  };
+}
+
+async function checkExportAccess(req, res, rid) {
+  const rRes = await pool.query("select * from reports where id=$1", [rid]);
+  const report = rRes.rows[0];
+  if (!report) { res.status(404).json({ error: "Не найдено" }); return null; }
+  if (!(await canAccessReport(req.user, report))) { res.status(403).json({ error: "Forbidden" }); return null; }
+  if (report.status !== "approved") { res.status(409).json({ error: "Отчёт ещё не одобрен — скачивание станет доступно после одобрения РМ" }); return null; }
+  return report;
+}
+
+app.get("/api/reports/:id/export/xlsx", auth, async (req, res) => {
+  const rid = req.params.id;
+  const report = await checkExportAccess(req, res, rid);
+  if (!report) return;
+  const data = await loadFullReport(rid);
+
+  const wb = new ExcelJS.Workbook();
+  const ws1 = wb.addWorksheet("FSS");
+  ws1.addRow([`Медпред: ${data.mp.full_name}`, `Территория: ${data.mp.territory || "—"}`, `РМ: ${data.rm_name}`]);
+  ws1.addRow([`Период: ${data.report.period_month}/${data.report.period_year}`]);
+  ws1.addRow([]);
+  ws1.addRow(["Препарат", "NRV $", "План, уп.", "Факт, уп.", "План, $", "Факт, $", "Дост., %"]).font = { bold: true };
+  data.fssItems.forEach((it) => {
+    ws1.addRow([it.product_name, Number(it.nrv_usd), Number(it.target_qty), Number(it.actual_qty), it.target_usd, it.actual_usd, it.target_usd ? it.actual_usd / it.target_usd : 0]);
+  });
+  ws1.addRow([]);
+  ws1.addRow(["ИТОГО", "", "", "", data.targetUsd, data.actualUsd, data.achievement]).font = { bold: true };
+  ws1.addRow([]);
+  ws1.addRow(["Бонус, UZS", Math.round(data.bonusUzs)]);
+  ws1.addRow(["Бонус, $", Math.round(data.bonusUsd)]);
+  ws1.getColumn(1).width = 30;
+
+  const ws2 = wb.addWorksheet("FFE");
+  ws2.addRow(["Метрика", "База (master list)", "Утверждено", "Достигнуто", "%"]).font = { bold: true };
+  data.ffeItems.forEach((it) => ws2.addRow([it.label, it.master_list_count, it.approved_count, it.achieved_count, it.percent]));
+  ws2.addRow([]);
+  ws2.addRow(["Общий FFE score", "", "", "", data.ffeScore]).font = { bold: true };
+  ws2.addRow(["Порог допуска к бонусу", "", "", "", 0.85]);
+  ws2.getColumn(1).width = 34;
+
+  const ws3 = wb.addWorksheet("Action Plan");
+  ws3.addRow(["Препарат", "Цель", "План действий", "Контрольная дата", "Дата завершения"]).font = { bold: true };
+  data.actionPlan.forEach((it) => ws3.addRow([it.product_name, it.goal, it.action_text, it.control_date, it.completion_date]));
+  ws3.columns.forEach((c) => (c.width = 28));
+
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="report_${rid}.xlsx"`);
+  await wb.xlsx.write(res);
+  res.end();
+});
+
+app.get("/api/reports/:id/export/pptx", auth, async (req, res) => {
+  const rid = req.params.id;
+  const report = await checkExportAccess(req, res, rid);
+  if (!report) return;
+  const data = await loadFullReport(rid);
+
+  const pptx = new PptxGenJS();
+  pptx.defineLayout({ name: "WIDE", width: 13.33, height: 7.5 });
+  pptx.layout = "WIDE";
+  const DARK = "0E1726", GOLD = "E8B04B", GREEN = "3FB88F", TEXT = "F5F0E6";
+
+  // Slide 1 — cover
+  let s = pptx.addSlide();
+  s.background = { color: DARK };
+  s.addText("Бизнес-ревью медпредставителя", { x: 0.6, y: 2.4, w: 12, h: 1, fontSize: 32, bold: true, color: TEXT });
+  s.addText(`${data.mp.full_name}  ·  ${data.mp.territory || "—"}  ·  РМ: ${data.rm_name}`, { x: 0.6, y: 3.3, w: 12, h: 0.6, fontSize: 18, color: GOLD });
+  s.addText(`Период: ${data.report.period_month}/${data.report.period_year}`, { x: 0.6, y: 3.9, w: 12, h: 0.5, fontSize: 14, color: TEXT });
+
+  // Slide 2 — FSS summary
+  s = pptx.addSlide();
+  s.background = { color: DARK };
+  s.addText("FSS — план vs факт", { x: 0.5, y: 0.4, fontSize: 24, bold: true, color: TEXT });
+  s.addText(`Достижение: ${(data.achievement * 100).toFixed(1)}%`, { x: 0.5, y: 1.1, fontSize: 20, color: data.achievement >= 1 ? GREEN : GOLD });
+  s.addText(`План: $${Math.round(data.targetUsd).toLocaleString()}   Факт: $${Math.round(data.actualUsd).toLocaleString()}`, { x: 0.5, y: 1.7, fontSize: 16, color: TEXT });
+  s.addText(`Бонус: ${Math.round(data.bonusUzs).toLocaleString()} UZS (~$${Math.round(data.bonusUsd).toLocaleString()})`, { x: 0.5, y: 2.2, fontSize: 16, color: GOLD, bold: true });
+  const rows = [["Препарат", "План, уп.", "Факт, уп.", "Дост."]];
+  data.fssItems.slice(0, 12).forEach((it) => rows.push([it.product_name, String(it.target_qty), String(it.actual_qty), it.target_usd ? `${((it.actual_usd / it.target_usd) * 100).toFixed(0)}%` : "—"]));
+  s.addTable(rows, { x: 0.5, y: 2.8, w: 12, fontSize: 11, color: TEXT, border: { color: "3A4A66", pt: 0.5 }, fill: { color: "141F33" } });
+
+  // Slide 3 — FFE
+  s = pptx.addSlide();
+  s.background = { color: DARK };
+  s.addText("FFE — Field Force Effectiveness", { x: 0.5, y: 0.4, fontSize: 24, bold: true, color: TEXT });
+  s.addText(`Общий score: ${(data.ffeScore * 100).toFixed(1)}%  (порог допуска к бонусу: 85%)`, {
+    x: 0.5, y: 1.1, fontSize: 16, color: data.ffeScore >= 0.85 ? GREEN : "E2574C", bold: true,
+  });
+  const ffeRows = [["Метрика", "База", "Утв.", "Достигнуто", "%"]];
+  data.ffeItems.forEach((it) => ffeRows.push([it.label, String(it.master_list_count), String(it.approved_count), String(it.achieved_count), `${(it.percent * 100).toFixed(0)}%`]));
+  s.addTable(ffeRows, { x: 0.5, y: 1.6, w: 12, fontSize: 11, color: TEXT, border: { color: "3A4A66", pt: 0.5 }, fill: { color: "141F33" } });
+
+  // Slide 4 — Action plan
+  s = pptx.addSlide();
+  s.background = { color: DARK };
+  s.addText("Action Plan", { x: 0.5, y: 0.4, fontSize: 24, bold: true, color: TEXT });
+  const apRows = [["Препарат", "Цель", "План действий", "Контроль", "Завершение"]];
+  data.actionPlan.forEach((it) => apRows.push([it.product_name || "", it.goal || "", it.action_text || "", it.control_date ? String(it.control_date).slice(0, 10) : "", it.completion_date ? String(it.completion_date).slice(0, 10) : ""]));
+  s.addTable(apRows, { x: 0.5, y: 1.0, w: 12.3, fontSize: 10, color: TEXT, border: { color: "3A4A66", pt: 0.5 }, fill: { color: "141F33" } });
+
+  const buffer = await pptx.write({ outputType: "nodebuffer" });
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.presentationml.presentation");
+  res.setHeader("Content-Disposition", `attachment; filename="report_${rid}.pptx"`);
+  res.end(buffer);
+});
+
+/* ============================================================ */
+app.get("/", (req, res) => res.send("FSS Review Platform API running"));
+
+// final error handler — any thrown/rejected error in a route ends up here as JSON,
+// instead of crashing the whole server process
+app.use((err, req, res, next) => {
+  console.error(err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: "Внутренняя ошибка сервера. Проверьте DATABASE_URL и логи." });
+});
+
+process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`FSS Review server running on port ${PORT}`));

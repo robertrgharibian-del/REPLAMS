@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background: #0e1726;
+  color: #f5f0e6;
+  font-family: "Inter", sans-serif;
+}
+.font-display { font-family: "Fraunces", serif; }
+.font-mono { font-family: "IBM Plex Mono", monospace; }
+
+input, select, textarea { font-family: inherit; }
+::selection { background: #e8b04b44; }
