@@ -123,6 +123,10 @@ create index if not exists idx_fss_report on report_fss(report_id);
 create index if not exists idx_ffe_report on report_ffe(report_id);
 create index if not exists idx_comments_report on report_comments(report_id);
 
+-- migration 002 (kept in sync here for fresh installs — see migration_002.sql for existing DBs)
+alter table reports add column if not exists non_reimbursement_ok boolean not null default true;
+create index if not exists idx_reports_period on reports(period_year, period_month);
+
 -- ============================================================
 -- SEED: product catalog (FY'27, MSN Rhythm + Prime)
 -- ============================================================

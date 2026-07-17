@@ -34,6 +34,23 @@ function tierLabel(achievement) {
   if (achievement <= 1.25) return "100% ставки (100-124.99%)";
   return "Потолок 125%";
 }
+function quarterOf(month) { return Math.floor((month - 1) / 3) + 1; }
+function monthsInQuarter(q) { return [3 * (q - 1) + 1, 3 * (q - 1) + 2, 3 * (q - 1) + 3]; }
+// RM multiplier table (Incentive Policy FY'27, slide "RM bonusi multiplikatori")
+function rmMultiplier(achievement) {
+  if (achievement < 0.9) return 0;       // RM doesn't qualify personally
+  if (achievement < 1.0) return 1.0;     // 90% - 99.99%
+  if (achievement < 1.05) return 1.5;    // 100% - 104.99%
+  if (achievement < 1.10) return 1.75;   // 105% - 109.99%
+  return 2.0;                            // 110%+
+}
+function rmMultiplierLabel(achievement) {
+  if (achievement < 0.9) return "RM не квалифицируется (<90%)";
+  if (achievement < 1.0) return "x1.00 (90-99.99%)";
+  if (achievement < 1.05) return "x1.50 (100-104.99%)";
+  if (achievement < 1.10) return "x1.75 (105-109.99%)";
+  return "x2.00 (110%+)";
+}
 const FFE_LABELS = {
   doctor_coverage_a: "Doctor coverage — Категория A",
   doctor_coverage_b: "Doctor coverage — Категория B",
@@ -289,7 +306,7 @@ app.get("/api/reports/:id", auth, async (req, res) => {
     return { ...row, target_usd: t, actual_usd: a };
   });
   const achievement = targetUsd === 0 ? 0 : actualUsd / targetUsd;
-  const bonusUzs = bonusFor(achievement, Number(report.base_rate_uzs));
+  const rawBonusUzs = bonusFor(achievement, Number(report.base_rate_uzs));
 
   // ---- computed FFE score ----
   const ffeItems = ffeRes.rows.map((row) => {
@@ -299,11 +316,21 @@ app.get("/api/reports/:id", auth, async (req, res) => {
   });
   const ffeScore = ffeItems.length ? ffeItems.reduce((s, x) => s + x.percent, 0) / ffeItems.length : 0;
   const ffeGatePassed = ffeScore >= FFE_GATE;
+  const nonReimbOk = report.non_reimbursement_ok;
+  const finalBonusUzs = (ffeGatePassed && nonReimbOk) ? rawBonusUzs : 0;
 
   res.json({
     report,
     mp: mpRes.rows[0],
-    fss: { items: fssItems, target_usd: targetUsd, actual_usd: actualUsd, achievement, bonus_uzs: bonusUzs, bonus_usd: bonusUzs / Number(report.fx_rate), tier_label: tierLabel(achievement) },
+    fss: {
+      items: fssItems, target_usd: targetUsd, actual_usd: actualUsd, achievement,
+      raw_bonus_uzs: rawBonusUzs, bonus_uzs: finalBonusUzs, bonus_usd: finalBonusUzs / Number(report.fx_rate),
+      tier_label: tierLabel(achievement),
+      gates: {
+        ffe_gate_passed: ffeGatePassed, ffe_score: ffeScore, ffe_threshold: FFE_GATE,
+        non_reimbursement_ok: nonReimbOk,
+      },
+    },
     ffe: { items: ffeItems, score: ffeScore, gate_passed: ffeGatePassed, gate_threshold: FFE_GATE },
     field_days: fieldDaysRes.rows[0],
     action_plan: apRes.rows,
@@ -389,8 +416,14 @@ app.put("/api/reports/:id/settings", auth, async (req, res) => {
   if (!report) return res.status(404).json({ error: "Не найдено" });
   if (!(await canAccessReport(req.user, report))) return res.status(403).json({ error: "Forbidden" });
   if (req.user.role === "mp" && !assertEditable(report, res)) return;
-  const { base_rate_uzs, fx_rate } = req.body;
-  await pool.query("update reports set base_rate_uzs=coalesce($1,base_rate_uzs), fx_rate=coalesce($2,fx_rate) where id=$3", [base_rate_uzs, fx_rate, rid]);
+  const { base_rate_uzs, fx_rate, non_reimbursement_ok } = req.body;
+  if (non_reimbursement_ok !== undefined && req.user.role === "mp") {
+    return res.status(403).json({ error: "Только РМ или мастер может подтверждать условие non-reimbursement" });
+  }
+  await pool.query(
+    "update reports set base_rate_uzs=coalesce($1,base_rate_uzs), fx_rate=coalesce($2,fx_rate), non_reimbursement_ok=coalesce($3,non_reimbursement_ok) where id=$4",
+    [base_rate_uzs, fx_rate, non_reimbursement_ok, rid]
+  );
   res.json({ ok: true });
 });
 
@@ -466,6 +499,148 @@ app.post("/api/reports/:id/comment", auth, requireRole("rm", "master"), async (r
 });
 
 /* ============================================================
+   Shared: quarterly bonus computation for one MP (3 monthly reports)
+   The Incentive Policy computes bonus per QUARTER, while MPs fill in
+   reports per MONTH — this aggregates the 3 months into the real,
+   policy-accurate quarterly number.
+   ============================================================ */
+async function computeMpQuarterBonus(mpId, year, quarter) {
+  const months = monthsInQuarter(Number(quarter));
+  const repsRes = await pool.query(
+    `select r.* from reports r where r.mp_id=$1 and r.period_year=$2 and r.period_month = any($3::int[]) order by r.period_month`,
+    [mpId, year, months]
+  );
+  const reps = repsRes.rows;
+  let target = 0, actual = 0, ffeSum = 0, nonReimbOk = true;
+  const monthly = [];
+  for (const m of months) {
+    const r = reps.find((x) => x.period_month === m);
+    if (!r) { monthly.push({ month: m, found: false }); continue; }
+    const fssRes = await pool.query(
+      `select f.target_qty, f.actual_qty, p.nrv_usd from report_fss f join products p on p.id=f.product_id where f.report_id=$1`, [r.id]
+    );
+    let mTarget = 0, mActual = 0;
+    for (const row of fssRes.rows) {
+      mTarget += Number(row.target_qty) * Number(row.nrv_usd);
+      mActual += Number(row.actual_qty) * Number(row.nrv_usd);
+    }
+    target += mTarget; actual += mActual;
+    const ffeRes = await pool.query("select * from report_ffe where report_id=$1", [r.id]);
+    const items = ffeRes.rows.map((row) => {
+      const denom = row.approved_count > 0 ? row.approved_count : row.master_list_count;
+      return denom > 0 ? row.achieved_count / denom : 0;
+    });
+    const ffeAvg = items.length ? items.reduce((s, x) => s + x, 0) / items.length : 0;
+    ffeSum += ffeAvg;
+    if (!r.non_reimbursement_ok) nonReimbOk = false;
+    monthly.push({ month: m, found: true, status: r.status, target_usd: mTarget, actual_usd: mActual, ffe_score: ffeAvg });
+  }
+  const allApproved = reps.length === 3 && reps.every((r) => r.status === "approved");
+  const ffeAvg = reps.length ? ffeSum / reps.length : 0;
+  const achievement = target === 0 ? 0 : actual / target;
+  const baseRateQuarter = reps[0] ? Number(reps[0].base_rate_uzs) : 15000000;
+  const rawBonus = bonusFor(achievement, baseRateQuarter);
+  const ffeGatePassed = ffeAvg >= FFE_GATE;
+  const qualifies = allApproved && achievement >= 0.9 && ffeGatePassed && nonReimbOk;
+  const bonus = qualifies ? rawBonus : 0;
+  return {
+    year: Number(year), quarter: Number(quarter), months, monthly,
+    target_usd: target, actual_usd: actual, achievement, tier_label: tierLabel(achievement),
+    ffe_score: ffeAvg, ffe_gate_passed: ffeGatePassed, non_reimbursement_ok: nonReimbOk,
+    all_months_approved: allApproved, raw_bonus_uzs: rawBonus, bonus_uzs: bonus,
+    base_rate_uzs: baseRateQuarter,
+  };
+}
+
+app.get("/api/mp-bonus/:mpId", auth, async (req, res) => {
+  const { mpId } = req.params;
+  const { year, quarter } = req.query;
+  if (!year || !quarter) return res.status(400).json({ error: "Укажите year и quarter" });
+  if (req.user.role === "mp" && String(req.user.id) !== String(mpId)) return res.status(403).json({ error: "Forbidden" });
+  if (req.user.role === "rm") {
+    const chk = await pool.query("select rm_id from users where id=$1", [mpId]);
+    if (!chk.rows[0] || chk.rows[0].rm_id !== req.user.id) return res.status(403).json({ error: "Forbidden" });
+  }
+  const mpRes = await pool.query("select id, full_name, territory from users where id=$1 and role='mp'", [mpId]);
+  if (!mpRes.rows[0]) return res.status(404).json({ error: "МП не найден" });
+  const data = await computeMpQuarterBonus(mpId, year, quarter);
+  res.json({ mp: mpRes.rows[0], ...data });
+});
+
+/* ============================================================
+   ALL COMMENTS — master sees every conversation on the platform
+   ============================================================ */
+app.get("/api/comments/all", auth, requireRole("master"), async (req, res) => {
+  const { rows } = await pool.query(`
+    select c.*, u.full_name as author_name,
+           r.period_year, r.period_month, r.status as report_status,
+           mp.full_name as mp_name, mp.id as mp_id, rm.full_name as rm_name
+    from report_comments c
+    join users u on u.id = c.author_id
+    join reports r on r.id = c.report_id
+    join users mp on mp.id = r.mp_id
+    left join users rm on rm.id = mp.rm_id
+    order by c.created_at desc
+    limit 500
+  `);
+  res.json(rows);
+});
+
+/* ============================================================
+   RM BONUS — multiplier x average bonus of the MR team
+   (Incentive Policy FY'27, "RM bonusi multiplikatori")
+   ============================================================ */
+app.get("/api/rm-bonus", auth, async (req, res) => {
+  const { year, quarter, rm_id } = req.query;
+  if (!year || !quarter) return res.status(400).json({ error: "Укажите year и quarter" });
+
+  let targetRmId;
+  if (req.user.role === "rm") {
+    targetRmId = req.user.id;
+  } else if (req.user.role === "master") {
+    if (!rm_id) return res.status(400).json({ error: "Укажите rm_id" });
+    targetRmId = rm_id;
+  } else {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const rmRes = await pool.query("select id, full_name, territory from users where id=$1 and role='rm'", [targetRmId]);
+  const rm = rmRes.rows[0];
+  if (!rm) return res.status(404).json({ error: "РМ не найден" });
+
+  const mpsRes = await pool.query("select id, full_name, territory from users where rm_id=$1 and role='mp' and is_active=true order by full_name", [targetRmId]);
+  const mps = mpsRes.rows;
+
+  const team = [];
+  let teamTargetUsd = 0, teamActualUsd = 0;
+  for (const mp of mps) {
+    const d = await computeMpQuarterBonus(mp.id, year, quarter);
+    teamTargetUsd += d.target_usd; teamActualUsd += d.actual_usd;
+    team.push({
+      mp_id: mp.id, mp_name: mp.full_name, territory: mp.territory,
+      reports_found: d.monthly.filter((m) => m.found).length, all_approved: d.all_months_approved,
+      achievement: d.achievement, ffe_score: d.ffe_score, non_reimbursement_ok: d.non_reimbursement_ok,
+      qualifies: d.bonus_uzs > 0, bonus_uzs: d.bonus_uzs,
+    });
+  }
+
+  const qualifiedCount = team.filter((t) => t.qualifies).length;
+  const teamQualifies = mps.length > 0 && qualifiedCount / mps.length >= 0.5;
+  const avgMrBonus = team.length ? team.reduce((s, t) => s + t.bonus_uzs, 0) / team.length : 0;
+  const rmAchievement = teamTargetUsd === 0 ? 0 : teamActualUsd / teamTargetUsd; // RM territory = sum of MP territories
+  const multiplier = rmMultiplier(rmAchievement);
+  const rmBonusUzs = (teamQualifies && rmAchievement >= 0.9) ? multiplier * avgMrBonus : 0;
+
+  res.json({
+    rm, year: Number(year), quarter: Number(quarter),
+    team, team_size: mps.length, qualified_count: qualifiedCount, team_qualifies: teamQualifies,
+    rm_achievement: rmAchievement, rm_target_usd: teamTargetUsd, rm_actual_usd: teamActualUsd,
+    multiplier, multiplier_label: rmMultiplierLabel(rmAchievement),
+    avg_mr_bonus_uzs: avgMrBonus, rm_bonus_uzs: rmBonusUzs,
+  });
+});
+
+/* ============================================================
    EXPORTS — available once status = 'approved'
    ============================================================ */
 async function loadFullReport(rid) {
@@ -490,7 +665,7 @@ async function loadFullReport(rid) {
     return { ...r, target_usd: t, actual_usd: a };
   });
   const achievement = targetUsd === 0 ? 0 : actualUsd / targetUsd;
-  const bonusUzs = bonusFor(achievement, Number(report.base_rate_uzs));
+  const rawBonusUzs = bonusFor(achievement, Number(report.base_rate_uzs));
 
   const ffeItems = ffeRes.rows.map((r) => {
     const denom = r.approved_count > 0 ? r.approved_count : r.master_list_count;
@@ -498,11 +673,13 @@ async function loadFullReport(rid) {
     return { ...r, label: FFE_LABELS[r.metric_key], percent: pct };
   });
   const ffeScore = ffeItems.length ? ffeItems.reduce((s, x) => s + x.percent, 0) / ffeItems.length : 0;
+  const ffeGatePassed = ffeScore >= FFE_GATE;
+  const bonusUzs = (ffeGatePassed && report.non_reimbursement_ok) ? rawBonusUzs : 0;
 
   return {
     report, mp: mpRes.rows[0], rm_name: rmRes.rows[0]?.full_name || "—",
-    fssItems, targetUsd, actualUsd, achievement, bonusUzs, bonusUsd: bonusUzs / Number(report.fx_rate),
-    ffeItems, ffeScore, actionPlan: apRes.rows,
+    fssItems, targetUsd, actualUsd, achievement, rawBonusUzs, bonusUzs, bonusUsd: bonusUzs / Number(report.fx_rate),
+    ffeItems, ffeScore, ffeGatePassed, actionPlan: apRes.rows,
   };
 }
 
@@ -533,8 +710,11 @@ app.get("/api/reports/:id/export/xlsx", auth, async (req, res) => {
   ws1.addRow([]);
   ws1.addRow(["ИТОГО", "", "", "", data.targetUsd, data.actualUsd, data.achievement]).font = { bold: true };
   ws1.addRow([]);
-  ws1.addRow(["Бонус, UZS", Math.round(data.bonusUzs)]);
-  ws1.addRow(["Бонус, $", Math.round(data.bonusUsd)]);
+  ws1.addRow(["Расчётный бонус (по FSS), UZS", Math.round(data.rawBonusUzs)]);
+  ws1.addRow(["FFE gate (>=85%)", data.ffeGatePassed ? "пройден" : "НЕ пройден — бонус обнулён"]);
+  ws1.addRow(["Non-reimbursement условие (>=50%)", data.report.non_reimbursement_ok ? "подтверждено" : "НЕ подтверждено — бонус обнулён"]);
+  ws1.addRow(["ИТОГОВЫЙ бонус, UZS", Math.round(data.bonusUzs)]).font = { bold: true };
+  ws1.addRow(["ИТОГОВЫЙ бонус, $", Math.round(data.bonusUsd)]).font = { bold: true };
   ws1.getColumn(1).width = 30;
 
   const ws2 = wb.addWorksheet("FFE");

@@ -44,6 +44,10 @@ export const api = {
   approveReport: (id, comment_text) => request(`/api/reports/${id}/approve-rm`, { method: "POST", body: { comment_text } }),
   addComment: (id, payload) => request(`/api/reports/${id}/comment`, { method: "POST", body: payload }),
 
+  mpBonus: (mpId, year, quarter) => request(`/api/mp-bonus/${mpId}?year=${year}&quarter=${quarter}`),
+  rmBonus: (year, quarter, rmId) => request(`/api/rm-bonus?year=${year}&quarter=${quarter}${rmId ? `&rm_id=${rmId}` : ""}`),
+  allComments: () => request("/api/comments/all"),
+
   exportUrl: (id, type) => `${BASE}/api/reports/${id}/export/${type}`,
 };
 
