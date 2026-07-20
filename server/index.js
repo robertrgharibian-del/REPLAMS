@@ -464,7 +464,9 @@ app.get("/api/reports", auth, async (req, res) => {
     where.push(`mp.rm_id = $${i++}`);
     values.push(req.user.id);
     where.push(`r.status != 'draft'`); // RM only sees reports the MP has actually submitted for review
-  } // master: no restriction
+  } else if (req.user.role === "master") {
+    where.push(`r.status != 'draft'`); // hide unfinished drafts from the master list too
+  }
 
   if (year) { where.push(`r.period_year = $${i++}`); values.push(year); }
   if (month) { where.push(`r.period_month = $${i++}`); values.push(month); }

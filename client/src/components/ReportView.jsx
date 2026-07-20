@@ -109,34 +109,38 @@ export default function ReportView({ reportId, user, onBack }) {
 
   useEffect(() => { load(); }, [load]);
 
-  if (!detail) return <div className="p-8">Загрузка…</div>;
+  const fssItemsSafe = detail?.fss?.items || [];
+  const ffeItemsSafe = detail?.ffe?.items || [];
+  const editableSafe = detail ? user.role === "mp" && ["draft", "returned"].includes(detail.report.status) : false;
+  const fssEditable = editableSafe && !fssLocked;
+  const ffeEditable = editableSafe && !ffeLocked;
 
-  const { report, mp, fss, ffe, comments } = detail;
-  const editable = user.role === "mp" && ["draft", "returned"].includes(report.status);
-  const fssEditable = editable && !fssLocked;
-  const ffeEditable = editable && !ffeLocked;
-  const convEditable = editable && !convLocked;
-  const potEditable = editable && !potLocked;
-
-  const liveFssItems = useMemo(() => fss.items.map((item, idx) => {
+  const liveFssItems = useMemo(() => fssItemsSafe.map((item, idx) => {
     const nrv = Number(item.nrv_usd);
     const t = fssEditable ? toNum(fssRows[idx]?.target_qty) : Number(item.target_qty);
     const a = fssEditable ? toNum(fssRows[idx]?.actual_qty) : Number(item.actual_qty);
     return { ...item, target_qty: t, actual_qty: a, target_usd: t * nrv, actual_usd: a * nrv };
-  }), [fss.items, fssRows, fssEditable]);
+  }), [fssItemsSafe, fssRows, fssEditable]);
   const liveFssTotals = useMemo(() => {
     const target_usd = liveFssItems.reduce((s, i) => s + i.target_usd, 0);
     const actual_usd = liveFssItems.reduce((s, i) => s + i.actual_usd, 0);
     return { target_usd, actual_usd, achievement: target_usd === 0 ? 0 : actual_usd / target_usd };
   }, [liveFssItems]);
-  const liveFfeItems = useMemo(() => ffe.items.map((item, idx) => {
+  const liveFfeItems = useMemo(() => ffeItemsSafe.map((item, idx) => {
     const master_list_count = ffeEditable ? toNum(ffeRows[idx]?.master_list_count) : Number(item.master_list_count);
     const approved_count = ffeEditable ? toNum(ffeRows[idx]?.approved_count) : Number(item.approved_count);
     const achieved_count = ffeEditable ? toNum(ffeRows[idx]?.achieved_count) : Number(item.achieved_count);
     const denom = approved_count > 0 ? approved_count : master_list_count;
     const percent = denom > 0 ? achieved_count / denom : 0;
     return { ...item, master_list_count, approved_count, achieved_count, percent };
-  }), [ffe.items, ffeRows, ffeEditable]);
+  }), [ffeItemsSafe, ffeRows, ffeEditable]);
+
+  if (!detail) return <div className="p-8">Загрузка…</div>;
+
+  const { report, mp, fss, ffe, comments } = detail;
+  const editable = editableSafe;
+  const convEditable = editable && !convLocked;
+  const potEditable = editable && !potLocked;
   const canReview = user.role === "rm" && report.status === "submitted";
   const canComment = (user.role === "rm" || user.role === "master") && ["submitted", "approved"].includes(report.status);
   const canToggleGate = user.role === "rm" || user.role === "master";
