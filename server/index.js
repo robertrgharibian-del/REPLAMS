@@ -7,6 +7,12 @@ const bcrypt = require("bcryptjs");
 const { Pool } = require("pg");
 const ExcelJS = require("exceljs");
 const PptxGenJS = require("pptxgenjs");
+const nodemailer = require("nodemailer");
+const { createEvents } = require("ics");
+const multer = require("multer");
+const cron = require("node-cron");
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+const { TERRITORIES, parseFssWorkbook, parseTargetsWorkbook, monthToCalendarYear } = require("./import.js");
 
 const app = express();
 app.use(cors({ origin: process.env.CLIENT_URL || "*" }));
@@ -18,6 +24,66 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret";
+
+/* ============================================================
+   Email reminders — Action Plan control/completion dates as
+   calendar invites (.ics). Silently no-ops if SMTP_HOST isn't set,
+   so the app works fine without email configured.
+   ============================================================ */
+const mailEnabled = !!process.env.SMTP_HOST;
+const transporter = mailEnabled
+  ? nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: Number(process.env.SMTP_PORT) === 465,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    })
+  : null;
+
+function dateToIcsArray(dateStr) {
+  const d = new Date(dateStr);
+  return [d.getFullYear(), d.getMonth() + 1, d.getDate()];
+}
+
+async function sendActionPlanReminders(mp, rmEmail, items) {
+  if (!mailEnabled) return;
+  const events = [];
+  for (const it of items) {
+    if (it.control_date) {
+      events.push({
+        title: `[Action Plan] Контроль: ${it.product_name || "препарат"}`,
+        description: `Цель: ${it.goal || "-"}\nДействие: ${it.action_text || "-"}`,
+        start: dateToIcsArray(it.control_date),
+        duration: { hours: 1 },
+        alarms: [{ action: "display", trigger: { hours: 9, before: true } }],
+      });
+    }
+    if (it.completion_date) {
+      events.push({
+        title: `[Action Plan] Завершение: ${it.product_name || "препарат"}`,
+        description: `Цель: ${it.goal || "-"}\nДействие: ${it.action_text || "-"}`,
+        start: dateToIcsArray(it.completion_date),
+        duration: { hours: 1 },
+        alarms: [{ action: "display", trigger: { hours: 9, before: true } }],
+      });
+    }
+  }
+  if (!events.length) return;
+  const { error, value } = createEvents(events);
+  if (error) { console.error("ics build error:", error); return; }
+  try {
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: mp.email,
+      cc: rmEmail || undefined,
+      subject: `Action Plan — напоминания (${events.length})`,
+      text: "Во вложении — календарные напоминания по датам контроля/завершения из вашего Action Plan.",
+      icalEvent: { filename: "action-plan.ics", method: "PUBLISH", content: value },
+    });
+  } catch (e) {
+    console.error("Failed to send action plan reminder email:", e.message);
+  }
+}
 
 /* ============================================================
    Bonus policy helpers (Incentive Policy FY'27)
@@ -161,6 +227,9 @@ app.post("/api/users", auth, requireRole("master"), async (req, res) => {
   if (!email || !password || !full_name || !role) return res.status(400).json({ error: "Заполните все обязательные поля" });
   if (!["rm", "mp"].includes(role)) return res.status(400).json({ error: "Недопустимая роль" });
   if (role === "mp" && !rm_id) return res.status(400).json({ error: "Для медпреда обязательно нужно указать РМ" });
+  if (role === "mp" && !TERRITORIES.some((t) => t.label === territory)) {
+    return res.status(400).json({ error: "Выберите территорию из списка" });
+  }
   const hash = await bcrypt.hash(password, 10);
   try {
     const { rows } = await pool.query(
@@ -202,6 +271,93 @@ app.get("/api/products", auth, async (req, res) => {
 });
 
 /* ============================================================
+   TERRITORIES — fixed catalog used for MP account creation and imports
+   ============================================================ */
+app.get("/api/territories", auth, async (req, res) => {
+  res.json(TERRITORIES.map((t) => ({ key: t.key, label: t.label })));
+});
+
+/* ============================================================
+   BULK IMPORT — master uploads the monthly FSS workbook or the
+   annual Target workbook; data is distributed to MPs by territory.
+   ============================================================ */
+app.post("/api/import/fss", auth, requireRole("master"), upload.single("file"), async (req, res) => {
+  const { year, month } = req.body;
+  if (!req.file) return res.status(400).json({ error: "Файл не получен" });
+  if (!year || !month) return res.status(400).json({ error: "Укажите год и месяц" });
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(req.file.buffer);
+  const productsRes = await pool.query("select id, name from products order by sort_order");
+  const { byTerritory, unmatchedProducts, missingAreas } = parseFssWorkbook(wb, productsRes.rows);
+
+  const usersRes = await pool.query("select id, full_name, territory from users where role='mp' and is_active=true");
+  const territoryLabelToKey = Object.fromEntries(TERRITORIES.map((t) => [t.label, t.key]));
+
+  let mpUpdated = 0;
+  const noMpForTerritory = [];
+  for (const t of TERRITORIES) {
+    const data = byTerritory[t.key];
+    if (!data) continue;
+    const mps = usersRes.rows.filter((u) => u.territory === t.label);
+    if (mps.length === 0) { noMpForTerritory.push(t.label); continue; }
+    for (const mp of mps) {
+      const report = await getOrCreateReport(mp.id, Number(year), Number(month));
+      for (const [productId, qty] of Object.entries(data)) {
+        await pool.query("update report_fss set actual_qty=$1 where report_id=$2 and product_id=$3", [qty, report.id, productId]);
+      }
+      mpUpdated++;
+    }
+  }
+
+  const summary = { mp_updated: mpUpdated, unmatched_products: unmatchedProducts, missing_areas: missingAreas, no_mp_for_territory: noMpForTerritory };
+  await pool.query(
+    "insert into import_log (import_type, period_year, period_month, uploaded_by, summary) values ('fss',$1,$2,$3,$4)",
+    [year, month, req.user.id, summary]
+  );
+  res.json(summary);
+});
+
+app.post("/api/import/targets", auth, requireRole("master"), upload.single("file"), async (req, res) => {
+  const { fy } = req.body;
+  if (!req.file) return res.status(400).json({ error: "Файл не получен" });
+  if (!fy) return res.status(400).json({ error: "Укажите финансовый год (например, 27)" });
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(req.file.buffer);
+  const productsRes = await pool.query("select id, name from products order by sort_order");
+  const { byTerritory, unmatchedProducts, missingSheets } = parseTargetsWorkbook(wb, productsRes.rows);
+
+  const usersRes = await pool.query("select id, full_name, territory from users where role='mp' and is_active=true");
+
+  let mpUpdated = 0;
+  const noMpForTerritory = [];
+  for (const t of TERRITORIES) {
+    const perProduct = byTerritory[t.key];
+    if (!perProduct) continue;
+    const mps = usersRes.rows.filter((u) => u.territory === t.label);
+    if (mps.length === 0) { noMpForTerritory.push(t.label); continue; }
+    for (const mp of mps) {
+      for (let month = 1; month <= 12; month++) {
+        const calYear = monthToCalendarYear(month, Number(fy));
+        const report = await getOrCreateReport(mp.id, calYear, month);
+        for (const [productId, monthly] of Object.entries(perProduct)) {
+          await pool.query("update report_fss set target_qty=$1 where report_id=$2 and product_id=$3", [monthly[month] || 0, report.id, productId]);
+        }
+      }
+      mpUpdated++;
+    }
+  }
+
+  const summary = { mp_updated: mpUpdated, unmatched_products: unmatchedProducts, missing_sheets: missingSheets, no_mp_for_territory: noMpForTerritory };
+  await pool.query(
+    "insert into import_log (import_type, period_year, uploaded_by, summary) values ('targets',$1,$2,$3)",
+    [1999 + Number(fy), req.user.id, summary]
+  );
+  res.json(summary);
+});
+
+/* ============================================================
    REPORTS — list (role-scoped)
    ============================================================ */
 app.get("/api/reports", auth, async (req, res) => {
@@ -234,22 +390,19 @@ app.get("/api/reports", auth, async (req, res) => {
 });
 
 // get-or-create current MP's report for a period
-app.post("/api/reports", auth, requireRole("mp"), async (req, res) => {
-  const { period_year, period_month } = req.body;
-  if (!period_year || !period_month) return res.status(400).json({ error: "Укажите год и месяц" });
+async function getOrCreateReport(mpId, periodYear, periodMonth) {
   let { rows } = await pool.query(
     "select * from reports where mp_id=$1 and period_year=$2 and period_month=$3",
-    [req.user.id, period_year, period_month]
+    [mpId, periodYear, periodMonth]
   );
-  if (rows[0]) return res.json(rows[0]);
+  if (rows[0]) return rows[0];
 
   const created = await pool.query(
     "insert into reports (mp_id, period_year, period_month) values ($1,$2,$3) returning *",
-    [req.user.id, period_year, period_month]
+    [mpId, periodYear, periodMonth]
   );
   const report = created.rows[0];
 
-  // seed empty FSS rows for every product
   const products = await pool.query("select id from products order by sort_order");
   for (const p of products.rows) {
     await pool.query(
@@ -257,17 +410,20 @@ app.post("/api/reports", auth, requireRole("mp"), async (req, res) => {
       [report.id, p.id]
     );
   }
-  // seed empty FFE rows
   for (const key of Object.keys(FFE_LABELS)) {
     await pool.query(
       "insert into report_ffe (report_id, metric_key, master_list_count, approved_count, achieved_count) values ($1,$2,0,0,0)",
       [report.id, key]
     );
   }
-  await pool.query(
-    "insert into report_field_days (report_id) values ($1)",
-    [report.id]
-  );
+  await pool.query("insert into report_field_days (report_id) values ($1)", [report.id]);
+  return report;
+}
+
+app.post("/api/reports", auth, requireRole("mp"), async (req, res) => {
+  const { period_year, period_month } = req.body;
+  if (!period_year || !period_month) return res.status(400).json({ error: "Укажите год и месяц" });
+  const report = await getOrCreateReport(req.user.id, period_year, period_month);
   res.json(report);
 });
 
@@ -288,6 +444,12 @@ app.get("/api/reports/:id", auth, async (req, res) => {
   const ffeRes = await pool.query("select * from report_ffe where report_id=$1", [rid]);
   const fieldDaysRes = await pool.query("select * from report_field_days where report_id=$1", [rid]);
   const apRes = await pool.query("select * from report_action_plan where report_id=$1 order by sort_order, id", [rid]);
+  const convRes = await pool.query(
+    `select c.*, p.name as product_name, p.nrv_usd from report_conversion c join products p on p.id=c.product_id where c.report_id=$1 order by c.id`, [rid]
+  );
+  const potRes = await pool.query(
+    `select c.*, p.name as product_name, p.nrv_usd from report_potential c join products p on p.id=c.product_id where c.report_id=$1 order by c.id`, [rid]
+  );
   const commentsRes = await pool.query(
     `select c.*, u.full_name as author_name from report_comments c
      join users u on u.id = c.author_id where c.report_id=$1 order by c.created_at`, [rid]
@@ -319,6 +481,33 @@ app.get("/api/reports/:id", auth, async (req, res) => {
   const nonReimbOk = report.non_reimbursement_ok;
   const finalBonusUzs = (ffeGatePassed && nonReimbOk) ? rawBonusUzs : 0;
 
+  // ---- Conversion / Potential brand-level summary ----
+  // base = this report's actual sales for the product (packs/month);
+  // additional = sum of (target - current) Rx/week * WEEKS_PER_MONTH, converted to $ at NRV
+  const WEEKS_PER_MONTH = 4.33;
+  const baseByProduct = {};
+  fssItems.forEach((it) => { baseByProduct[it.product_id] = { qty: Number(it.actual_qty), usd: it.actual_usd, nrv: Number(it.nrv_usd) }; });
+
+  function buildBrandSummary(rows, currentField) {
+    const byProduct = {};
+    for (const r of rows) {
+      const pid = r.product_id;
+      if (!byProduct[pid]) byProduct[pid] = { product_id: pid, product_name: r.product_name, nrv_usd: Number(r.nrv_usd), additional_packs: 0 };
+      const deltaPerWeek = Number(r.target_rx_per_week) - Number(r[currentField]);
+      byProduct[pid].additional_packs += Math.max(0, deltaPerWeek) * WEEKS_PER_MONTH;
+    }
+    return Object.values(byProduct).map((b) => {
+      const base = baseByProduct[b.product_id] || { qty: 0, usd: 0 };
+      const additional_usd = b.additional_packs * b.nrv_usd;
+      return {
+        product_id: b.product_id, product_name: b.product_name,
+        base_packs: base.qty, base_usd: base.usd,
+        additional_packs: b.additional_packs, additional_usd,
+        total_packs: base.qty + b.additional_packs, total_usd: base.usd + additional_usd,
+      };
+    });
+  }
+
   res.json({
     report,
     mp: mpRes.rows[0],
@@ -334,6 +523,8 @@ app.get("/api/reports/:id", auth, async (req, res) => {
     ffe: { items: ffeItems, score: ffeScore, gate_passed: ffeGatePassed, gate_threshold: FFE_GATE },
     field_days: fieldDaysRes.rows[0],
     action_plan: apRes.rows,
+    conversion: { items: convRes.rows, summary: buildBrandSummary(convRes.rows, "current_rx_per_week") },
+    potential: { items: potRes.rows, summary: buildBrandSummary(potRes.rows, "current_potential_per_week") },
     comments: commentsRes.rows,
     status_log: logRes.rows,
   });
@@ -407,7 +598,111 @@ app.put("/api/reports/:id/action-plan", auth, requireRole("mp"), async (req, res
   }
   await pool.query("update reports set updated_at = now() where id=$1", [rid]);
   res.json({ ok: true });
+
+  // fire-and-forget: email calendar invites for control/completion dates (no-op if SMTP not configured)
+  try {
+    const mpRes = await pool.query("select id, full_name, email, rm_id from users where id=$1", [req.user.id]);
+    const mpRow = mpRes.rows[0];
+    let rmEmail = null;
+    if (mpRow?.rm_id) {
+      const rmRes = await pool.query("select email from users where id=$1", [mpRow.rm_id]);
+      rmEmail = rmRes.rows[0]?.email || null;
+    }
+    await sendActionPlanReminders(mpRow, rmEmail, items || []);
+  } catch (e) {
+    console.error("Action plan reminder dispatch failed:", e.message);
+  }
 });
+
+app.put("/api/reports/:id/conversion", auth, requireRole("mp"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1 and mp_id=$2", [rid, req.user.id]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!assertEditable(report, res)) return;
+  const { items } = req.body;
+  await pool.query("delete from report_conversion where report_id=$1", [rid]);
+  for (const it of items || []) {
+    await pool.query(
+      `insert into report_conversion
+       (report_id, product_id, doctor_name, current_rx_per_week, competitor_rx_per_week, competitor_reason, mp_action_plan, target_rx_per_week, start_date, control_date)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [rid, it.product_id, it.doctor_name || "", it.current_rx_per_week || 0, it.competitor_rx_per_week || 0,
+       it.competitor_reason || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.start_date || null, it.control_date || null]
+    );
+  }
+  await pool.query("update reports set updated_at = now() where id=$1", [rid]);
+  res.json({ ok: true });
+});
+
+app.put("/api/reports/:id/potential", auth, requireRole("mp"), async (req, res) => {
+  const rid = req.params.id;
+  const rRes = await pool.query("select * from reports where id=$1 and mp_id=$2", [rid, req.user.id]);
+  const report = rRes.rows[0];
+  if (!report) return res.status(404).json({ error: "Не найдено" });
+  if (!assertEditable(report, res)) return;
+  const { items } = req.body;
+  await pool.query("delete from report_potential where report_id=$1", [rid]);
+  for (const it of items || []) {
+    await pool.query(
+      `insert into report_potential
+       (report_id, product_id, doctor_name, current_potential_per_week, reason_not_treating, mp_action_plan, target_rx_per_week, start_date, control_date)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [rid, it.product_id, it.doctor_name || "", it.current_potential_per_week || 0,
+       it.reason_not_treating || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.start_date || null, it.control_date || null]
+    );
+  }
+  await pool.query("update reports set updated_at = now() where id=$1", [rid]);
+  res.json({ ok: true });
+});
+
+async function checkWeeklyReminders() {
+  if (!mailEnabled) return;
+  for (const entityType of ["conversion", "potential"]) {
+    const table = entityType === "conversion" ? "report_conversion" : "report_potential";
+    const rows = await pool.query(`select * from ${table} where control_date is not null`);
+    for (const row of rows.rows) {
+      const lastRes = await pool.query(
+        "select sent_at from reminder_log where entity_type=$1 and entity_id=$2 order by sent_at desc limit 1",
+        [entityType, row.id]
+      );
+      const last = lastRes.rows[0];
+      const daysSince = last ? (Date.now() - new Date(last.sent_at).getTime()) / 86400000 : Infinity;
+      if (daysSince < 7) continue;
+
+      const repRes = await pool.query(
+        "select r.id, u.full_name as mp_name, u.email as mp_email, u.rm_id from reports r join users u on u.id=r.mp_id where r.id=$1",
+        [row.report_id]
+      );
+      const rep = repRes.rows[0];
+      if (!rep) continue;
+      let rmEmail = null;
+      if (rep.rm_id) {
+        const rmRes = await pool.query("select email from users where id=$1", [rep.rm_id]);
+        rmEmail = rmRes.rows[0]?.email || null;
+      }
+      const prodRes = await pool.query("select name from products where id=$1", [row.product_id]);
+      const productName = prodRes.rows[0]?.name || "";
+      const kindLabel = entityType === "conversion" ? "Конверсия" : "Увеличение потенциала";
+
+      try {
+        await transporter.sendMail({
+          from: process.env.SMTP_FROM || process.env.SMTP_USER,
+          to: rep.mp_email,
+          cc: rmEmail || undefined,
+          subject: `[${kindLabel}] Еженедельное напоминание — врач ${row.doctor_name}`,
+          text: `Препарат: ${productName}\nВрач: ${row.doctor_name}\nДата контроля: ${row.control_date}\n\nЭто еженедельное напоминание обсудить с региональным менеджером прогресс по данному врачу (раздел "${kindLabel}").`,
+        });
+        await pool.query("insert into reminder_log (entity_type, entity_id) values ($1,$2)", [entityType, row.id]);
+      } catch (e) {
+        console.error(`Weekly reminder send failed for ${entityType}#${row.id}:`, e.message);
+      }
+    }
+  }
+}
+if (mailEnabled) {
+  cron.schedule("0 8 * * *", () => { checkWeeklyReminders().catch((e) => console.error("Weekly reminder job failed:", e.message)); });
+}
 
 app.put("/api/reports/:id/settings", auth, async (req, res) => {
   const rid = req.params.id;
@@ -656,6 +951,10 @@ async function loadFullReport(rid) {
      join products p on p.id=f.product_id where f.report_id=$1 order by p.sort_order`, [rid]);
   const ffeRes = await pool.query("select * from report_ffe where report_id=$1", [rid]);
   const apRes = await pool.query("select * from report_action_plan where report_id=$1 order by sort_order,id", [rid]);
+  const convRes = await pool.query(
+    `select c.*, p.name as product_name from report_conversion c join products p on p.id=c.product_id where c.report_id=$1`, [rid]);
+  const potRes = await pool.query(
+    `select c.*, p.name as product_name from report_potential c join products p on p.id=c.product_id where c.report_id=$1`, [rid]);
 
   let targetUsd = 0, actualUsd = 0;
   const fssItems = fssRes.rows.map((r) => {
@@ -679,7 +978,7 @@ async function loadFullReport(rid) {
   return {
     report, mp: mpRes.rows[0], rm_name: rmRes.rows[0]?.full_name || "—",
     fssItems, targetUsd, actualUsd, achievement, rawBonusUzs, bonusUzs, bonusUsd: bonusUzs / Number(report.fx_rate),
-    ffeItems, ffeScore, ffeGatePassed, actionPlan: apRes.rows,
+    ffeItems, ffeScore, ffeGatePassed, actionPlan: apRes.rows, conversion: convRes.rows, potential: potRes.rows,
   };
 }
 
@@ -729,6 +1028,16 @@ app.get("/api/reports/:id/export/xlsx", auth, async (req, res) => {
   ws3.addRow(["Препарат", "Цель", "План действий", "Контрольная дата", "Дата завершения"]).font = { bold: true };
   data.actionPlan.forEach((it) => ws3.addRow([it.product_name, it.goal, it.action_text, it.control_date, it.completion_date]));
   ws3.columns.forEach((c) => (c.width = 28));
+
+  const ws4 = wb.addWorksheet("Конверсия");
+  ws4.addRow(["Препарат", "Врач", "Наш преп., Rx/нед", "Конкуренты, Rx/нед", "Почему конкуренты", "План МП", "Цель, Rx/нед", "Начало", "Контроль"]).font = { bold: true };
+  data.conversion.forEach((it) => ws4.addRow([it.product_name, it.doctor_name, Number(it.current_rx_per_week), Number(it.competitor_rx_per_week), it.competitor_reason, it.mp_action_plan, Number(it.target_rx_per_week), it.start_date, it.control_date]));
+  ws4.columns.forEach((c) => (c.width = 24));
+
+  const ws5 = wb.addWorksheet("Увеличение потенциала");
+  ws5.addRow(["Препарат", "Врач", "Текущий потенциал, Rx/нед", "Причина", "План МП", "Цель, Rx/нед", "Начало", "Контроль"]).font = { bold: true };
+  data.potential.forEach((it) => ws5.addRow([it.product_name, it.doctor_name, Number(it.current_potential_per_week), it.reason_not_treating, it.mp_action_plan, Number(it.target_rx_per_week), it.start_date, it.control_date]));
+  ws5.columns.forEach((c) => (c.width = 24));
 
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", `attachment; filename="report_${rid}.xlsx"`);

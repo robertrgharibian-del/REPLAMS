@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
 
-function CreateUserForm({ rms, onCreated }) {
+function CreateUserForm({ rms, territories, onCreated }) {
   const [role, setRole] = useState("mp");
   const [form, setForm] = useState({ email: "", password: "", full_name: "", territory: "", rm_id: "" });
   const [error, setError] = useState("");
@@ -11,7 +11,7 @@ function CreateUserForm({ rms, onCreated }) {
     e.preventDefault();
     setError(""); setBusy(true);
     try {
-      await api.createUser({ ...form, role, rm_id: role === "mp" ? form.rm_id : undefined });
+      await api.createUser({ ...form, role, rm_id: role === "mp" ? form.rm_id : undefined, territory: role === "mp" ? form.territory : undefined });
       setForm({ email: "", password: "", full_name: "", territory: "", rm_id: "" });
       onCreated();
     } catch (e2) { setError(e2.message); } finally { setBusy(false); }
@@ -36,8 +36,13 @@ function CreateUserForm({ rms, onCreated }) {
           className="bg-transparent border rounded px-3 py-2" style={{ borderColor: "#3A4A66" }} />
         <input required type="password" placeholder="Пароль" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })}
           className="bg-transparent border rounded px-3 py-2" style={{ borderColor: "#3A4A66" }} />
-        <input placeholder="Территория" value={form.territory} onChange={(e) => setForm({ ...form, territory: e.target.value })}
-          className="bg-transparent border rounded px-3 py-2" style={{ borderColor: "#3A4A66" }} />
+        {role === "mp" && (
+          <select required value={form.territory} onChange={(e) => setForm({ ...form, territory: e.target.value })}
+            className="bg-transparent border rounded px-3 py-2" style={{ borderColor: "#3A4A66" }}>
+            <option value="" style={{ color: "#000" }}>— выберите территорию —</option>
+            {territories.map((t) => <option key={t.key} value={t.label} style={{ color: "#000" }}>{t.label}</option>)}
+          </select>
+        )}
         {role === "mp" && (
           <select required value={form.rm_id} onChange={(e) => setForm({ ...form, rm_id: e.target.value })}
             className="bg-transparent border rounded px-3 py-2 sm:col-span-2" style={{ borderColor: "#3A4A66" }}>
@@ -57,10 +62,12 @@ function CreateUserForm({ rms, onCreated }) {
 export default function MasterUsers() {
   const [users, setUsers] = useState([]);
   const [rms, setRms] = useState([]);
+  const [territories, setTerritories] = useState([]);
 
   async function loadAll() {
     setUsers(await api.listUsers());
     setRms(await api.listRms());
+    setTerritories(await api.listTerritories());
   }
   useEffect(() => { loadAll(); }, []);
 
@@ -69,7 +76,7 @@ export default function MasterUsers() {
       <div className="font-display text-2xl font-semibold mb-1">Пользователи</div>
       <div className="text-sm mb-6" style={{ color: "#8493AA" }}>Создание аккаунтов РМ и медпредов</div>
 
-      <CreateUserForm rms={rms} onCreated={loadAll} />
+      <CreateUserForm rms={rms} territories={territories} onCreated={loadAll} />
 
       <div className="rounded-2xl overflow-x-auto" style={{ border: "1px solid #22304A" }}>
         <table className="w-full text-sm">

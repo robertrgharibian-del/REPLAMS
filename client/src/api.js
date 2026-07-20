@@ -23,6 +23,7 @@ export const api = {
 
   listUsers: () => request("/api/users"),
   listRms: () => request("/api/users/rms"),
+  listTerritories: () => request("/api/territories"),
   createUser: (payload) => request("/api/users", { method: "POST", body: payload }),
   patchUser: (id, payload) => request(`/api/users/${id}`, { method: "PATCH", body: payload }),
 
@@ -38,6 +39,8 @@ export const api = {
   saveFss: (id, items) => request(`/api/reports/${id}/fss`, { method: "PUT", body: { items } }),
   saveFfe: (id, items, field_days) => request(`/api/reports/${id}/ffe`, { method: "PUT", body: { items, field_days } }),
   saveActionPlan: (id, items) => request(`/api/reports/${id}/action-plan`, { method: "PUT", body: { items } }),
+  saveConversion: (id, items) => request(`/api/reports/${id}/conversion`, { method: "PUT", body: { items } }),
+  savePotential: (id, items) => request(`/api/reports/${id}/potential`, { method: "PUT", body: { items } }),
   saveSettings: (id, payload) => request(`/api/reports/${id}/settings`, { method: "PUT", body: payload }),
   submitReport: (id) => request(`/api/reports/${id}/submit`, { method: "POST" }),
   returnReport: (id, comment_text) => request(`/api/reports/${id}/return`, { method: "POST", body: { comment_text } }),
@@ -49,6 +52,23 @@ export const api = {
   allComments: () => request("/api/comments/all"),
 
   exportUrl: (id, type) => `${BASE}/api/reports/${id}/export/${type}`,
+
+  importFss: async (file, year, month) => {
+    const fd = new FormData();
+    fd.append("file", file); fd.append("year", year); fd.append("month", month);
+    const res = await fetch(`${BASE}/api/import/fss`, { method: "POST", headers: authHeaders(), body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Ошибка загрузки");
+    return data;
+  },
+  importTargets: async (file, fy) => {
+    const fd = new FormData();
+    fd.append("file", file); fd.append("fy", fy);
+    const res = await fetch(`${BASE}/api/import/targets`, { method: "POST", headers: authHeaders(), body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Ошибка загрузки");
+    return data;
+  },
 };
 
 export function authedDownload(url) {

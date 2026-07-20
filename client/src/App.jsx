@@ -5,13 +5,14 @@ import MpPanel from "./pages/MpPanel.jsx";
 import RmPanel from "./pages/RmPanel.jsx";
 import MasterReports from "./pages/MasterReports.jsx";
 import MasterUsers from "./pages/MasterUsers.jsx";
+import MasterImports from "./pages/MasterImports.jsx";
 import AllComments from "./pages/AllComments.jsx";
 import RmBonusView from "./components/RmBonusView.jsx";
 
 const ROLE_LABEL = { master: "Мастер-аккаунт", rm: "Региональный менеджер", mp: "Медпредставитель" };
 
 const NAV = {
-  master: [["reports", "Отчёты"], ["users", "Пользователи"], ["comments", "Комментарии"]],
+  master: [["reports", "Отчёты"], ["users", "Пользователи"], ["imports", "Загрузка данных"], ["comments", "Комментарии"]],
   rm: [["team", "Команда"], ["bonus", "Мой бонус"]],
   mp: [["report", "Мой отчёт"]],
 };
@@ -69,6 +70,7 @@ export default function App() {
 
       {user.role === "master" && section === "reports" && <MasterReports user={user} />}
       {user.role === "master" && section === "users" && <MasterUsers />}
+      {user.role === "master" && section === "imports" && <MasterImports />}
       {user.role === "master" && section === "comments" && <AllComments />}
 
       {user.role === "rm" && section === "team" && <RmPanel user={user} />}

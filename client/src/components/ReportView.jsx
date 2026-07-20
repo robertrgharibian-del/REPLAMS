@@ -39,6 +39,17 @@ function RowComments({ comments, section, itemRef, canComment, onAdd }) {
 
 const inputStyle = (color) => ({ borderColor: "#3A4A66", color: color || "#F5F0E6", background: "transparent" });
 
+// Color tiers per feedback: >=90% green, 80-89.99% yellow, <80% red
+function achColor(pct) {
+  if (pct >= 0.9) return "#3FB88F";
+  if (pct >= 0.8) return "#E8B04B";
+  return "#E2574C";
+}
+function fmtDelta(n, prefix = "") {
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${prefix}${Math.round(n).toLocaleString()}`;
+}
+
 export default function ReportView({ reportId, user, onBack }) {
   const [detail, setDetail] = useState(null);
   const [tab, setTab] = useState("fss");
@@ -46,6 +57,8 @@ export default function ReportView({ reportId, user, onBack }) {
   const [ffeRows, setFfeRows] = useState([]);
   const [fieldDays, setFieldDays] = useState(null);
   const [apRows, setApRows] = useState([]);
+  const [convRows, setConvRows] = useState([]);
+  const [potRows, setPotRows] = useState([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [returnText, setReturnText] = useState("");
@@ -61,6 +74,10 @@ export default function ReportView({ reportId, user, onBack }) {
     })));
     setFieldDays(d.field_days ? Object.fromEntries(Object.entries(d.field_days).map(([k, v]) => [k, typeof v === "number" ? toInputStr(v) : v])) : null);
     setApRows(d.action_plan.map((a) => ({ ...a })));
+    setConvRows(d.conversion.items.map((c) => ({ ...c,
+      current_rx_per_week: toInputStr(c.current_rx_per_week), competitor_rx_per_week: toInputStr(c.competitor_rx_per_week), target_rx_per_week: toInputStr(c.target_rx_per_week) })));
+    setPotRows(d.potential.items.map((c) => ({ ...c,
+      current_potential_per_week: toInputStr(c.current_potential_per_week), target_rx_per_week: toInputStr(c.target_rx_per_week) })));
     const quarter = Math.floor((d.report.period_month - 1) / 3) + 1;
     api.mpBonus(d.report.mp_id, d.report.period_year, quarter).then(setQuarterBonus).catch(() => setQuarterBonus(null));
   }, [reportId]);
@@ -97,6 +114,20 @@ export default function ReportView({ reportId, user, onBack }) {
   async function saveActionPlan() {
     setBusy(true); setError("");
     try { await api.saveActionPlan(reportId, apRows); await load(); } catch (e) { setError(e.message); } finally { setBusy(false); }
+  }
+  async function saveConversion() {
+    setBusy(true); setError("");
+    try {
+      await api.saveConversion(reportId, convRows.map((r) => ({ ...r, current_rx_per_week: toNum(r.current_rx_per_week), competitor_rx_per_week: toNum(r.competitor_rx_per_week), target_rx_per_week: toNum(r.target_rx_per_week) })));
+      await load();
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
+  }
+  async function savePotential() {
+    setBusy(true); setError("");
+    try {
+      await api.savePotential(reportId, potRows.map((r) => ({ ...r, current_potential_per_week: toNum(r.current_potential_per_week), target_rx_per_week: toNum(r.target_rx_per_week) })));
+      await load();
+    } catch (e) { setError(e.message); } finally { setBusy(false); }
   }
   async function submit() {
     setBusy(true); setError("");
@@ -140,7 +171,7 @@ export default function ReportView({ reportId, user, onBack }) {
 
       {/* Tabs — horizontally scrollable on mobile instead of overflowing */}
       <div className="flex gap-2 mb-5 overflow-x-auto pb-1 -mx-4 px-4 sm:mx-0 sm:px-0" style={{ scrollbarWidth: "thin" }}>
-        {[["fss", "FSS"], ["ffe", "FFE"], ["plan", "Action Plan"], ["bonus", "Бонус"], ["comments", "История"]].map(([k, label]) => (
+        {[["fss", "FSS"], ["ffe", "FFE"], ["plan", "Общий план"], ["conversion", "Конверсия"], ["potential", "Увеличение потенциала"], ["bonus", "Бонус"], ["comments", "История"]].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)}
             className="px-4 py-2 rounded-lg text-sm font-medium shrink-0"
             style={{ background: tab === k ? "#E8B04B" : "#141F33", color: tab === k ? "#0E1726" : "#C9D2E0", border: "1px solid #22304A" }}>
@@ -160,6 +191,7 @@ export default function ReportView({ reportId, user, onBack }) {
                 <th className="text-right py-1 px-2">NRV $</th>
                 <th className="text-right py-1 px-2">План, уп.</th>
                 <th className="text-right py-1 px-2">Факт, уп.</th>
+                <th className="text-right py-1 px-2">Δ уп. / $</th>
                 <th className="text-right py-1">Дост.</th>
               </tr>
             </thead>
@@ -181,7 +213,16 @@ export default function ReportView({ reportId, user, onBack }) {
                           className="w-20 border-b text-right font-mono px-1" style={inputStyle("#E8B04B")} />
                       ) : <span className="font-mono" style={{ color: "#E8B04B" }}>{item.actual_qty}</span>}
                     </td>
-                    <td className="text-right font-mono">{item.target_usd ? `${((item.actual_usd / item.target_usd) * 100).toFixed(0)}%` : "—"}</td>
+                    <td className="text-right font-mono">
+                      {item.target_usd
+                        ? <span style={{ color: item.actual_qty - item.target_qty >= 0 ? "#3FB88F" : "#E2574C" }}>
+                            {fmtDelta(item.actual_qty - item.target_qty)} уп. / {fmtDelta(item.actual_usd - item.target_usd, "$")}
+                          </span>
+                        : "—"}
+                    </td>
+                    <td className="text-right font-mono" style={{ color: item.target_usd ? achColor(item.actual_usd / item.target_usd) : "#8493AA" }}>
+                      {item.target_usd ? `${((item.actual_usd / item.target_usd) * 100).toFixed(0)}%` : "—"}
+                    </td>
                   </tr>
                   <tr><td colSpan={5}><RowComments comments={comments} section="fss" itemRef={item.product_id} canComment={canComment}
                     onAdd={(t) => addComment("fss", item.product_id, t)} /></td></tr>
@@ -215,18 +256,33 @@ export default function ReportView({ reportId, user, onBack }) {
                   </div>
                   <div className="text-right">
                     <div className="text-[10px] uppercase mb-1" style={{ color: "#8493AA" }}>Дост.</div>
-                    <div className="font-mono text-sm py-1.5">{item.target_usd ? `${((item.actual_usd / item.target_usd) * 100).toFixed(0)}%` : "—"}</div>
+                    <div className="font-mono text-sm py-1.5" style={{ color: item.target_usd ? achColor(item.actual_usd / item.target_usd) : "#8493AA" }}>
+                      {item.target_usd ? `${((item.actual_usd / item.target_usd) * 100).toFixed(0)}%` : "—"}
+                    </div>
                   </div>
                 </div>
+                {item.target_usd > 0 && (
+                  <div className="text-xs font-mono mt-1" style={{ color: item.actual_qty - item.target_qty >= 0 ? "#3FB88F" : "#E2574C" }}>
+                    Δ {fmtDelta(item.actual_qty - item.target_qty)} уп. · {fmtDelta(item.actual_usd - item.target_usd, "$")}
+                  </div>
+                )}
                 <RowComments comments={comments} section="fss" itemRef={item.product_id} canComment={canComment}
                   onAdd={(t) => addComment("fss", item.product_id, t)} />
               </div>
             ))}
           </div>
 
-          <div className="flex flex-wrap justify-between gap-2 mt-4 text-sm font-mono">
-            <span>План: ${Math.round(fss.target_usd).toLocaleString()} · Факт: ${Math.round(fss.actual_usd).toLocaleString()}</span>
-            <span style={{ color: "#E8B04B" }}>{fss.tier_label}</span>
+          <div className="mt-4 rounded-xl p-4 flex flex-wrap items-center justify-between gap-2" style={{ background: "linear-gradient(90deg,#1B2A44,#141F33)" }}>
+            <div>
+              <div className="text-xs uppercase" style={{ color: "#8493AA" }}>Общее достижение, $</div>
+              <div className="font-mono text-lg font-bold" style={{ color: achColor(fss.achievement) }}>
+                ${Math.round(fss.actual_usd).toLocaleString()} / ${Math.round(fss.target_usd).toLocaleString()} · {(fss.achievement * 100).toFixed(1)}%
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="text-xs uppercase" style={{ color: "#8493AA" }}>Тариф</div>
+              <div className="text-sm" style={{ color: "#E8B04B" }}>{fss.tier_label}</div>
+            </div>
           </div>
           {editable && <button onClick={saveFss} disabled={busy} className="mt-4 px-4 py-2 rounded font-semibold" style={{ background: "#3FB88F", color: "#0E1726" }}>Сохранить FSS</button>}
         </div>
@@ -247,11 +303,15 @@ export default function ReportView({ reportId, user, onBack }) {
                 <th className="text-right px-2">В мастер-листе</th>
                 <th className="text-right px-2">Утверждено</th>
                 <th className="text-right px-2">Достигнуто</th>
+                <th className="text-right px-2">Δ</th>
                 <th className="text-right">%</th>
               </tr>
             </thead>
             <tbody>
-              {ffe.items.map((item, idx) => (
+              {ffe.items.map((item, idx) => {
+                const denom = item.approved_count > 0 ? item.approved_count : item.master_list_count;
+                const delta = item.achieved_count - denom;
+                return (
                 <React.Fragment key={item.metric_key}>
                   <tr style={{ borderTop: "1px solid #22304A" }}>
                     <td className="py-1.5" style={{ color: "#C9D2E0" }}>{item.label}</td>
@@ -263,21 +323,25 @@ export default function ReportView({ reportId, user, onBack }) {
                         ) : <span className="font-mono">{item[field]}</span>}
                       </td>
                     ))}
-                    <td className="text-right font-mono" style={{ color: item.percent >= 0.85 ? "#3FB88F" : "#E2574C" }}>{(item.percent * 100).toFixed(0)}%</td>
+                    <td className="text-right px-2 font-mono" style={{ color: delta >= 0 ? "#3FB88F" : "#E2574C" }}>{denom > 0 ? fmtDelta(delta) : "—"}</td>
+                    <td className="text-right font-mono" style={{ color: achColor(item.percent) }}>{(item.percent * 100).toFixed(0)}%</td>
                   </tr>
-                  <tr><td colSpan={5}><RowComments comments={comments} section="ffe" itemRef={item.id} canComment={canComment}
+                  <tr><td colSpan={6}><RowComments comments={comments} section="ffe" itemRef={item.id} canComment={canComment}
                     onAdd={(t) => addComment("ffe", item.id, t)} /></td></tr>
                 </React.Fragment>
-              ))}
+              );})}
             </tbody>
           </table>
 
           <div className="md:hidden space-y-2">
-            {ffe.items.map((item, idx) => (
+            {ffe.items.map((item, idx) => {
+              const denom = item.approved_count > 0 ? item.approved_count : item.master_list_count;
+              const delta = item.achieved_count - denom;
+              return (
               <div key={item.metric_key} className="rounded-xl p-3" style={{ background: "#1B2A44" }}>
                 <div className="flex justify-between items-center mb-2">
                   <div className="text-sm font-medium" style={{ color: "#C9D2E0" }}>{item.label}</div>
-                  <div className="font-mono text-sm shrink-0 ml-2" style={{ color: item.percent >= 0.85 ? "#3FB88F" : "#E2574C" }}>{(item.percent * 100).toFixed(0)}%</div>
+                  <div className="font-mono text-sm shrink-0 ml-2" style={{ color: achColor(item.percent) }}>{(item.percent * 100).toFixed(0)}%</div>
                 </div>
                 <div className="grid grid-cols-3 gap-2">
                   {[["master_list_count", "База"], ["approved_count", "Утв."], ["achieved_count", "Дост."]].map(([field, label]) => (
@@ -290,10 +354,13 @@ export default function ReportView({ reportId, user, onBack }) {
                     </div>
                   ))}
                 </div>
+                {denom > 0 && (
+                  <div className="text-xs font-mono mt-1" style={{ color: delta >= 0 ? "#3FB88F" : "#E2574C" }}>Δ {fmtDelta(delta)}</div>
+                )}
                 <RowComments comments={comments} section="ffe" itemRef={item.id} canComment={canComment}
                   onAdd={(t) => addComment("ffe", item.id, t)} />
               </div>
-            ))}
+            );})}
           </div>
 
           {fieldDays && (
@@ -352,6 +419,207 @@ export default function ReportView({ reportId, user, onBack }) {
               <button onClick={() => setApRows((r) => [...r, { product_name: "", goal: "", action_text: "", control_date: "", completion_date: "" }])}
                 className="px-3 py-2 rounded text-sm" style={{ background: "#22304A" }}>+ добавить пункт</button>
               <button onClick={saveActionPlan} disabled={busy} className="px-4 py-2 rounded font-semibold" style={{ background: "#3FB88F", color: "#0E1726" }}>Сохранить Action Plan</button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* CONVERSION TAB */}
+      {tab === "conversion" && (
+        <div className="rounded-2xl p-4 sm:p-5" style={{ background: "#141F33", border: "1px solid #22304A" }}>
+          <div className="font-display text-lg mb-1">Конверсия врачей</div>
+          <div className="text-xs mb-4" style={{ color: "#8493AA" }}>Врачи, которых МП планирует конвертировать с конкурентов в этом месяце</div>
+
+          {convRows.map((row, idx) => (
+            <div key={idx} className="rounded-xl p-3 mb-3" style={{ background: "#1B2A44" }}>
+              <div className="grid sm:grid-cols-2 gap-2 text-sm mb-2">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Препарат</div>
+                  {editable ? (
+                    <select value={row.product_id || ""} onChange={(e) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, product_id: Number(e.target.value) } : x))}
+                      className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }}>
+                      <option value="" style={{ color: "#000" }}>— выбрать —</option>
+                      {fss.items.map((p) => <option key={p.product_id} value={p.product_id} style={{ color: "#000" }}>{p.product_name}</option>)}
+                    </select>
+                  ) : <div>{row.product_name}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Врач (ФИО)</div>
+                  {editable ? (
+                    <input value={row.doctor_name || ""} onChange={(e) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, doctor_name: e.target.value } : x))}
+                      className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} />
+                  ) : <div>{row.doctor_name}</div>}
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-sm mb-2">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Наш преп., Rx/нед</div>
+                  {editable ? <NumField value={row.current_rx_per_week} onChange={(v) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, current_rx_per_week: v } : x))}
+                    className="w-full border rounded px-2 py-1.5 font-mono" style={inputStyle()} /> : <div className="font-mono">{row.current_rx_per_week}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Конкуренты, Rx/нед</div>
+                  {editable ? <NumField value={row.competitor_rx_per_week} onChange={(v) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, competitor_rx_per_week: v } : x))}
+                    className="w-full border rounded px-2 py-1.5 font-mono" style={inputStyle()} /> : <div className="font-mono">{row.competitor_rx_per_week}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Цель к концу месяца, Rx/нед</div>
+                  {editable ? <NumField value={row.target_rx_per_week} onChange={(v) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, target_rx_per_week: v } : x))}
+                    className="w-full border rounded px-2 py-1.5 font-mono" style={inputStyle("#E8B04B")} /> : <div className="font-mono" style={{ color: "#E8B04B" }}>{row.target_rx_per_week}</div>}
+                </div>
+              </div>
+              <div className="grid sm:grid-cols-2 gap-2 text-sm mb-2">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Почему выписывает конкурентов</div>
+                  {editable ? <textarea rows={2} value={row.competitor_reason || ""} onChange={(e) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, competitor_reason: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.competitor_reason}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>План действий МП (визит, активности)</div>
+                  {editable ? <textarea rows={2} value={row.mp_action_plan || ""} onChange={(e) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, mp_action_plan: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.mp_action_plan}</div>}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-sm">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Дата начала активности</div>
+                  {editable ? <input type="date" value={row.start_date ? String(row.start_date).slice(0, 10) : ""} onChange={(e) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, start_date: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.start_date ? String(row.start_date).slice(0, 10) : "—"}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Дата контроля с РМ</div>
+                  {editable ? <input type="date" value={row.control_date ? String(row.control_date).slice(0, 10) : ""} onChange={(e) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, control_date: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.control_date ? String(row.control_date).slice(0, 10) : "—"}</div>}
+                </div>
+              </div>
+              {editable && <button onClick={() => setConvRows((r) => r.filter((_, i) => i !== idx))} className="text-xs mt-2" style={{ color: "#E2574C" }}>Удалить врача</button>}
+            </div>
+          ))}
+
+          {editable && (
+            <div className="flex flex-wrap gap-3 mb-6">
+              <button onClick={() => setConvRows((r) => [...r, { product_id: "", doctor_name: "", current_rx_per_week: "", competitor_rx_per_week: "", competitor_reason: "", mp_action_plan: "", target_rx_per_week: "", start_date: "", control_date: "" }])}
+                className="px-3 py-2 rounded text-sm" style={{ background: "#22304A" }}>+ добавить врача</button>
+              <button onClick={saveConversion} disabled={busy} className="px-4 py-2 rounded font-semibold" style={{ background: "#3FB88F", color: "#0E1726" }}>Сохранить Конверсию</button>
+            </div>
+          )}
+
+          {detail.conversion.summary.length > 0 && (
+            <div>
+              <div className="text-sm font-semibold mb-2" style={{ color: "#C9D2E0" }}>Прогноз по брендам: база + конверсия</div>
+              <table className="w-full text-sm">
+                <thead><tr style={{ color: "#8493AA", fontSize: 11 }} className="uppercase">
+                  <th className="text-left py-1">Препарат</th><th className="text-right px-2">База, $</th><th className="text-right px-2">+ Конверсия, $</th><th className="text-right">Итого, $</th>
+                </tr></thead>
+                <tbody>
+                  {detail.conversion.summary.map((s) => (
+                    <tr key={s.product_id} style={{ borderTop: "1px solid #22304A" }}>
+                      <td className="py-1.5">{s.product_name}</td>
+                      <td className="text-right px-2 font-mono">{Math.round(s.base_usd).toLocaleString()}</td>
+                      <td className="text-right px-2 font-mono" style={{ color: "#3FB88F" }}>+{Math.round(s.additional_usd).toLocaleString()}</td>
+                      <td className="text-right font-mono font-semibold">{Math.round(s.total_usd).toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* POTENTIAL TAB */}
+      {tab === "potential" && (
+        <div className="rounded-2xl p-4 sm:p-5" style={{ background: "#141F33", border: "1px solid #22304A" }}>
+          <div className="font-display text-lg mb-1">Увеличение потенциала</div>
+          <div className="text-xs mb-4" style={{ color: "#8493AA" }}>Врачи, у которых МП планирует увеличить потенциал назначений в этом месяце</div>
+
+          {potRows.map((row, idx) => (
+            <div key={idx} className="rounded-xl p-3 mb-3" style={{ background: "#1B2A44" }}>
+              <div className="grid sm:grid-cols-2 gap-2 text-sm mb-2">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Препарат</div>
+                  {editable ? (
+                    <select value={row.product_id || ""} onChange={(e) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, product_id: Number(e.target.value) } : x))}
+                      className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }}>
+                      <option value="" style={{ color: "#000" }}>— выбрать —</option>
+                      {fss.items.map((p) => <option key={p.product_id} value={p.product_id} style={{ color: "#000" }}>{p.product_name}</option>)}
+                    </select>
+                  ) : <div>{row.product_name}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Врач (ФИО)</div>
+                  {editable ? (
+                    <input value={row.doctor_name || ""} onChange={(e) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, doctor_name: e.target.value } : x))}
+                      className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} />
+                  ) : <div>{row.doctor_name}</div>}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-sm mb-2">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Текущий потенциал, Rx/нед</div>
+                  {editable ? <NumField value={row.current_potential_per_week} onChange={(v) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, current_potential_per_week: v } : x))}
+                    className="w-full border rounded px-2 py-1.5 font-mono" style={inputStyle()} /> : <div className="font-mono">{row.current_potential_per_week}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Цель к концу месяца, Rx/нед</div>
+                  {editable ? <NumField value={row.target_rx_per_week} onChange={(v) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, target_rx_per_week: v } : x))}
+                    className="w-full border rounded px-2 py-1.5 font-mono" style={inputStyle("#E8B04B")} /> : <div className="font-mono" style={{ color: "#E8B04B" }}>{row.target_rx_per_week}</div>}
+                </div>
+              </div>
+              <div className="grid sm:grid-cols-2 gap-2 text-sm mb-2">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Почему не лечит больше пациентов</div>
+                  {editable ? <textarea rows={2} value={row.reason_not_treating || ""} onChange={(e) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, reason_not_treating: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.reason_not_treating}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>План действий МП (визит, активности)</div>
+                  {editable ? <textarea rows={2} value={row.mp_action_plan || ""} onChange={(e) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, mp_action_plan: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.mp_action_plan}</div>}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-sm">
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Дата начала активности</div>
+                  {editable ? <input type="date" value={row.start_date ? String(row.start_date).slice(0, 10) : ""} onChange={(e) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, start_date: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.start_date ? String(row.start_date).slice(0, 10) : "—"}</div>}
+                </div>
+                <div>
+                  <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Дата контроля с РМ</div>
+                  {editable ? <input type="date" value={row.control_date ? String(row.control_date).slice(0, 10) : ""} onChange={(e) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, control_date: e.target.value } : x))}
+                    className="w-full bg-transparent border rounded px-2 py-1.5" style={{ borderColor: "#3A4A66" }} /> : <div>{row.control_date ? String(row.control_date).slice(0, 10) : "—"}</div>}
+                </div>
+              </div>
+              {editable && <button onClick={() => setPotRows((r) => r.filter((_, i) => i !== idx))} className="text-xs mt-2" style={{ color: "#E2574C" }}>Удалить врача</button>}
+            </div>
+          ))}
+
+          {editable && (
+            <div className="flex flex-wrap gap-3 mb-6">
+              <button onClick={() => setPotRows((r) => [...r, { product_id: "", doctor_name: "", current_potential_per_week: "", reason_not_treating: "", mp_action_plan: "", target_rx_per_week: "", start_date: "", control_date: "" }])}
+                className="px-3 py-2 rounded text-sm" style={{ background: "#22304A" }}>+ добавить врача</button>
+              <button onClick={savePotential} disabled={busy} className="px-4 py-2 rounded font-semibold" style={{ background: "#3FB88F", color: "#0E1726" }}>Сохранить Потенциал</button>
+            </div>
+          )}
+
+          {detail.potential.summary.length > 0 && (
+            <div>
+              <div className="text-sm font-semibold mb-2" style={{ color: "#C9D2E0" }}>Прогноз по брендам: база + рост потенциала</div>
+              <table className="w-full text-sm">
+                <thead><tr style={{ color: "#8493AA", fontSize: 11 }} className="uppercase">
+                  <th className="text-left py-1">Препарат</th><th className="text-right px-2">База, $</th><th className="text-right px-2">+ Потенциал, $</th><th className="text-right">Итого, $</th>
+                </tr></thead>
+                <tbody>
+                  {detail.potential.summary.map((s) => (
+                    <tr key={s.product_id} style={{ borderTop: "1px solid #22304A" }}>
+                      <td className="py-1.5">{s.product_name}</td>
+                      <td className="text-right px-2 font-mono">{Math.round(s.base_usd).toLocaleString()}</td>
+                      <td className="text-right px-2 font-mono" style={{ color: "#3FB88F" }}>+{Math.round(s.additional_usd).toLocaleString()}</td>
+                      <td className="text-right font-mono font-semibold">{Math.round(s.total_usd).toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
