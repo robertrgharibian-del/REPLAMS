@@ -248,19 +248,71 @@ app.post("/api/users", auth, requireRole("master"), async (req, res) => {
 });
 
 app.patch("/api/users/:id", auth, requireRole("master"), async (req, res) => {
-  const { is_active, territory, rm_id, full_name } = req.body;
+  const { is_active, territory, rm_id, full_name, password } = req.body;
   const fields = [];
   const values = [];
   let i = 1;
-  for (const [k, v] of Object.entries({ is_active, territory, rm_id, full_name })) {
+  const plain = { is_active, territory, rm_id, full_name };
+  for (const [k, v] of Object.entries(plain)) {
     if (v !== undefined) {
       fields.push(`${k} = $${i++}`);
       values.push(v);
     }
   }
+  if (password) {
+    const hash = await bcrypt.hash(password, 10);
+    fields.push(`password_hash = $${i++}`);
+    values.push(hash);
+  }
   if (!fields.length) return res.status(400).json({ error: "Нет полей для обновления" });
   values.push(req.params.id);
   await pool.query(`update users set ${fields.join(", ")} where id = $${i}`, values);
+  if (password) {
+    await pool.query("update password_reset_requests set status='resolved', resolved_at=now() where user_id=$1 and status='pending'", [req.params.id]);
+  }
+  res.json({ ok: true });
+});
+
+/* ---- Password reset requests: user requests -> master resolves ---- */
+app.post("/api/auth/request-reset", async (req, res) => {
+  const { email } = req.body;
+  if (email) {
+    const u = await pool.query("select id from users where email=$1 and is_active=true", [email.toLowerCase()]);
+    if (u.rows[0]) {
+      await pool.query("insert into password_reset_requests (user_id) values ($1)", [u.rows[0].id]);
+    }
+  }
+  // always return success — don't reveal whether the email exists
+  res.json({ ok: true });
+});
+
+app.get("/api/password-resets", auth, requireRole("master"), async (req, res) => {
+  const { rows } = await pool.query(
+    `select p.*, u.full_name, u.email, u.role from password_reset_requests p
+     join users u on u.id = p.user_id where p.status='pending' order by p.requested_at desc`
+  );
+  res.json(rows);
+});
+
+/* ---- Profile: any logged-in user can update their own basic info ---- */
+app.put("/api/auth/me", auth, async (req, res) => {
+  const { full_name, password, current_password } = req.body;
+  const fields = [];
+  const values = [];
+  let i = 1;
+  if (full_name) { fields.push(`full_name = $${i++}`); values.push(full_name); }
+  if (password) {
+    if (!current_password) return res.status(400).json({ error: "Укажите текущий пароль" });
+    const u = await pool.query("select password_hash from users where id=$1", [req.user.id]);
+    const ok = await bcrypt.compare(current_password, u.rows[0].password_hash);
+    if (!ok) return res.status(401).json({ error: "Текущий пароль неверен" });
+    const hash = await bcrypt.hash(password, 10);
+    fields.push(`password_hash = $${i++}`);
+    values.push(hash);
+  }
+  if (!fields.length) return res.status(400).json({ error: "Нечего обновлять" });
+  values.push(req.user.id);
+  await pool.query(`update users set ${fields.join(", ")} where id=$${i}`, values);
   res.json({ ok: true });
 });
 
@@ -283,6 +335,8 @@ app.get("/api/territories", auth, async (req, res) => {
    BULK IMPORT — master uploads the monthly FSS workbook or the
    annual Target workbook; data is distributed to MPs by territory.
    ============================================================ */
+function normTerritory(s) { return String(s || "").trim().toLowerCase(); }
+
 app.post("/api/import/fss", auth, requireRole("master"), upload.single("file"), async (req, res) => {
   const { year, month } = req.body;
   if (!req.file) return res.status(400).json({ error: "Файл не получен" });
@@ -294,18 +348,23 @@ app.post("/api/import/fss", auth, requireRole("master"), upload.single("file"), 
   const { byTerritory, unmatchedProducts, missingAreas } = parseFssWorkbook(wb, productsRes.rows);
 
   const usersRes = await pool.query("select id, full_name, territory from users where role='mp' and is_active=true");
-  const territoryLabelToKey = Object.fromEntries(TERRITORIES.map((t) => [t.label, t.key]));
 
   let mpUpdated = 0;
   const noMpForTerritory = [];
+  const changes = [];
   for (const t of TERRITORIES) {
     const data = byTerritory[t.key];
     if (!data) continue;
-    const mps = usersRes.rows.filter((u) => u.territory === t.label);
+    const mps = usersRes.rows.filter((u) => normTerritory(u.territory) === normTerritory(t.label));
     if (mps.length === 0) { noMpForTerritory.push(t.label); continue; }
     for (const mp of mps) {
       const report = await getOrCreateReport(mp.id, Number(year), Number(month));
       for (const [productId, qty] of Object.entries(data)) {
+        const oldRes = await pool.query("select actual_qty from report_fss where report_id=$1 and product_id=$2", [report.id, productId]);
+        const oldVal = oldRes.rows[0]?.actual_qty;
+        if (Number(oldVal) !== Number(qty)) {
+          changes.push({ report_id: report.id, product_id: Number(productId), field: "actual_qty", old_value: oldVal, new_value: qty });
+        }
         await pool.query("update report_fss set actual_qty=$1 where report_id=$2 and product_id=$3", [qty, report.id, productId]);
       }
       mpUpdated++;
@@ -313,11 +372,11 @@ app.post("/api/import/fss", auth, requireRole("master"), upload.single("file"), 
   }
 
   const summary = { mp_updated: mpUpdated, unmatched_products: unmatchedProducts, missing_areas: missingAreas, no_mp_for_territory: noMpForTerritory };
-  await pool.query(
-    "insert into import_log (import_type, period_year, period_month, uploaded_by, summary) values ('fss',$1,$2,$3,$4)",
-    [year, month, req.user.id, summary]
+  const logRes = await pool.query(
+    "insert into import_log (import_type, period_year, period_month, uploaded_by, summary, changes) values ('fss',$1,$2,$3,$4,$5) returning id",
+    [year, month, req.user.id, summary, JSON.stringify(changes)]
   );
-  res.json(summary);
+  res.json({ ...summary, import_id: logRes.rows[0].id });
 });
 
 app.post("/api/import/targets", auth, requireRole("master"), upload.single("file"), async (req, res) => {
@@ -334,17 +393,24 @@ app.post("/api/import/targets", auth, requireRole("master"), upload.single("file
 
   let mpUpdated = 0;
   const noMpForTerritory = [];
+  const changes = [];
   for (const t of TERRITORIES) {
     const perProduct = byTerritory[t.key];
     if (!perProduct) continue;
-    const mps = usersRes.rows.filter((u) => u.territory === t.label);
+    const mps = usersRes.rows.filter((u) => normTerritory(u.territory) === normTerritory(t.label));
     if (mps.length === 0) { noMpForTerritory.push(t.label); continue; }
     for (const mp of mps) {
       for (let month = 1; month <= 12; month++) {
         const calYear = monthToCalendarYear(month, Number(fy));
         const report = await getOrCreateReport(mp.id, calYear, month);
         for (const [productId, monthly] of Object.entries(perProduct)) {
-          await pool.query("update report_fss set target_qty=$1 where report_id=$2 and product_id=$3", [monthly[month] || 0, report.id, productId]);
+          const newVal = monthly[month] || 0;
+          const oldRes = await pool.query("select target_qty from report_fss where report_id=$1 and product_id=$2", [report.id, productId]);
+          const oldVal = oldRes.rows[0]?.target_qty;
+          if (Number(oldVal) !== Number(newVal)) {
+            changes.push({ report_id: report.id, product_id: Number(productId), field: "target_qty", old_value: oldVal, new_value: newVal });
+          }
+          await pool.query("update report_fss set target_qty=$1 where report_id=$2 and product_id=$3", [newVal, report.id, productId]);
         }
       }
       mpUpdated++;
@@ -352,11 +418,34 @@ app.post("/api/import/targets", auth, requireRole("master"), upload.single("file
   }
 
   const summary = { mp_updated: mpUpdated, unmatched_products: unmatchedProducts, missing_sheets: missingSheets, no_mp_for_territory: noMpForTerritory };
-  await pool.query(
-    "insert into import_log (import_type, period_year, uploaded_by, summary) values ('targets',$1,$2,$3)",
-    [1999 + Number(fy), req.user.id, summary]
+  const logRes = await pool.query(
+    "insert into import_log (import_type, period_year, uploaded_by, summary, changes) values ('targets',$1,$2,$3,$4) returning id",
+    [1999 + Number(fy), req.user.id, summary, JSON.stringify(changes)]
   );
-  res.json(summary);
+  res.json({ ...summary, import_id: logRes.rows[0].id });
+});
+
+/* ---- Import history: list + undo ---- */
+app.get("/api/import/history", auth, requireRole("master"), async (req, res) => {
+  const { rows } = await pool.query(
+    `select l.id, l.import_type, l.period_year, l.period_month, l.summary, l.reverted, l.created_at, u.full_name as uploaded_by_name
+     from import_log l join users u on u.id = l.uploaded_by order by l.created_at desc limit 50`
+  );
+  res.json(rows);
+});
+
+app.post("/api/import/:id/undo", auth, requireRole("master"), async (req, res) => {
+  const { id } = req.params;
+  const logRes = await pool.query("select * from import_log where id=$1", [id]);
+  const log = logRes.rows[0];
+  if (!log) return res.status(404).json({ error: "Импорт не найден" });
+  if (log.reverted) return res.status(409).json({ error: "Уже отменено" });
+  const changes = log.changes || [];
+  for (const c of changes) {
+    await pool.query(`update report_fss set ${c.field}=$1 where report_id=$2 and product_id=$3`, [c.old_value || 0, c.report_id, c.product_id]);
+  }
+  await pool.query("update import_log set reverted=true where id=$1", [id]);
+  res.json({ ok: true, reverted_cells: changes.length });
 });
 
 /* ============================================================
@@ -420,6 +509,37 @@ async function getOrCreateReport(mpId, periodYear, periodMonth) {
     );
   }
   await pool.query("insert into report_field_days (report_id) values ($1)", [report.id]);
+
+  // Carry forward doctor tracking from the previous month: the last plan
+  // becomes "locked previous target", MP reports actual result + sets a new plan.
+  const prevMonth = periodMonth === 1 ? 12 : periodMonth - 1;
+  const prevYear = periodMonth === 1 ? periodYear - 1 : periodYear;
+  const prevReportRes = await pool.query(
+    "select id from reports where mp_id=$1 and period_year=$2 and period_month=$3",
+    [mpId, prevYear, prevMonth]
+  );
+  const prevReport = prevReportRes.rows[0];
+  if (prevReport) {
+    const prevConv = await pool.query("select * from report_conversion where report_id=$1", [prevReport.id]);
+    for (const d of prevConv.rows) {
+      await pool.query(
+        `insert into report_conversion
+         (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_rx_per_week, competitor_rx_per_week, competitor_reason, mp_action_plan, target_rx_per_week, previous_target_rx_per_week, start_date, control_date)
+         values ($1,$2,$3,$4,$5,0,0,'','',0,$6,null,null)`,
+        [report.id, d.product_id, d.doctor_name, d.doctor_specialty, d.lpu_name, d.target_rx_per_week]
+      );
+    }
+    const prevPot = await pool.query("select * from report_potential where report_id=$1", [prevReport.id]);
+    for (const d of prevPot.rows) {
+      await pool.query(
+        `insert into report_potential
+         (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_potential_per_week, reason_not_treating, mp_action_plan, target_rx_per_week, previous_target_rx_per_week, start_date, control_date)
+         values ($1,$2,$3,$4,$5,0,'','',0,$6,null,null)`,
+        [report.id, d.product_id, d.doctor_name, d.doctor_specialty, d.lpu_name, d.target_rx_per_week]
+      );
+    }
+  }
+
   return report;
 }
 
@@ -628,10 +748,10 @@ app.put("/api/reports/:id/conversion", auth, requireRole("mp"), async (req, res)
   for (const it of items || []) {
     await pool.query(
       `insert into report_conversion
-       (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_rx_per_week, competitor_rx_per_week, competitor_reason, mp_action_plan, target_rx_per_week, start_date, control_date)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_rx_per_week, competitor_rx_per_week, competitor_reason, mp_action_plan, target_rx_per_week, previous_target_rx_per_week, actual_result_rx_per_week, start_date, control_date)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [rid, it.product_id, it.doctor_name || "", it.doctor_specialty || "", it.lpu_name || "", it.current_rx_per_week || 0, it.competitor_rx_per_week || 0,
-       it.competitor_reason || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.start_date || null, it.control_date || null]
+       it.competitor_reason || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.previous_target_rx_per_week ?? null, it.actual_result_rx_per_week ?? null, it.start_date || null, it.control_date || null]
     );
   }
   await pool.query("update reports set updated_at = now() where id=$1", [rid]);
@@ -649,10 +769,10 @@ app.put("/api/reports/:id/potential", auth, requireRole("mp"), async (req, res) 
   for (const it of items || []) {
     await pool.query(
       `insert into report_potential
-       (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_potential_per_week, reason_not_treating, mp_action_plan, target_rx_per_week, start_date, control_date)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+       (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_potential_per_week, reason_not_treating, mp_action_plan, target_rx_per_week, previous_target_rx_per_week, actual_result_rx_per_week, start_date, control_date)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [rid, it.product_id, it.doctor_name || "", it.doctor_specialty || "", it.lpu_name || "", it.current_potential_per_week || 0,
-       it.reason_not_treating || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.start_date || null, it.control_date || null]
+       it.reason_not_treating || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.previous_target_rx_per_week ?? null, it.actual_result_rx_per_week ?? null, it.start_date || null, it.control_date || null]
     );
   }
   await pool.query("update reports set updated_at = now() where id=$1", [rid]);
@@ -940,6 +1060,68 @@ app.get("/api/rm-bonus", auth, async (req, res) => {
 });
 
 /* ============================================================
+   DASHBOARD — visual org-wide (master) or team (rm) summary
+   ============================================================ */
+app.get("/api/dashboard", auth, requireRole("master", "rm"), async (req, res) => {
+  const rmFilter = req.user.role === "rm" ? "and rm.id = $1" : "";
+  const params = req.user.role === "rm" ? [req.user.id] : [];
+
+  const rmsRes = await pool.query(
+    `select rm.id, rm.full_name, rm.territory from users rm where rm.role='rm' and rm.is_active=true ${rmFilter} order by rm.full_name`,
+    params
+  );
+
+  const hierarchy = [];
+  let companyTarget = 0, companyActual = 0, companyBonusUzs = 0;
+
+  for (const rm of rmsRes.rows) {
+    const mpsRes = await pool.query("select id, full_name, territory from users where rm_id=$1 and role='mp' and is_active=true order by full_name", [rm.id]);
+    let rmTarget = 0, rmActual = 0;
+    const mpNodes = [];
+    for (const mp of mpsRes.rows) {
+      const latestRes = await pool.query(
+        "select id, period_year, period_month from reports where mp_id=$1 and status='approved' order by period_year desc, period_month desc limit 1",
+        [mp.id]
+      );
+      const latest = latestRes.rows[0];
+      let target_usd = 0, actual_usd = 0, achievement = null, bonus_uzs = 0;
+      if (latest) {
+        const fssRes = await pool.query(
+          `select f.target_qty, f.actual_qty, p.nrv_usd from report_fss f join products p on p.id=f.product_id where f.report_id=$1`, [latest.id]
+        );
+        for (const row of fssRes.rows) {
+          target_usd += Number(row.target_qty) * Number(row.nrv_usd);
+          actual_usd += Number(row.actual_qty) * Number(row.nrv_usd);
+        }
+        achievement = target_usd ? actual_usd / target_usd : null;
+        const quarter = quarterOf(latest.period_month);
+        const qb = await computeMpQuarterBonus(mp.id, latest.period_year, quarter);
+        bonus_uzs = qb.bonus_uzs;
+      }
+      rmTarget += target_usd; rmActual += actual_usd;
+      mpNodes.push({
+        id: mp.id, name: mp.full_name, territory: mp.territory,
+        latest_period: latest ? `${latest.period_month}/${latest.period_year}` : null,
+        target_usd: Math.round(target_usd), actual_usd: Math.round(actual_usd), achievement, bonus_uzs: Math.round(bonus_uzs),
+      });
+    }
+    companyTarget += rmTarget; companyActual += rmActual;
+    companyBonusUzs += mpNodes.reduce((s, m) => s + m.bonus_uzs, 0);
+    hierarchy.push({
+      id: rm.id, name: rm.full_name, territory: rm.territory,
+      target_usd: Math.round(rmTarget), actual_usd: Math.round(rmActual),
+      achievement: rmTarget ? rmActual / rmTarget : null,
+      mps: mpNodes,
+    });
+  }
+
+  res.json({
+    hierarchy,
+    company: { target_usd: Math.round(companyTarget), actual_usd: Math.round(companyActual), achievement: companyTarget ? companyActual / companyTarget : null, bonus_uzs: Math.round(companyBonusUzs) },
+  });
+});
+
+/* ============================================================
    AI INSIGHTS — deep month/quarter/year analysis, runs server-side.
    Requires ANTHROPIC_API_KEY (set once by the company, not per-user).
    ============================================================ */
@@ -1023,6 +1205,8 @@ async function loadFullReport(rid) {
     `select c.*, p.name as product_name from report_conversion c join products p on p.id=c.product_id where c.report_id=$1`, [rid]);
   const potRes = await pool.query(
     `select c.*, p.name as product_name from report_potential c join products p on p.id=c.product_id where c.report_id=$1`, [rid]);
+  const commentsRes = await pool.query(
+    `select cm.*, u.full_name as author_name from report_comments cm join users u on u.id=cm.author_id where cm.report_id=$1 order by cm.created_at`, [rid]);
 
   let targetUsd = 0, actualUsd = 0;
   const fssItems = fssRes.rows.map((r) => {
@@ -1042,11 +1226,13 @@ async function loadFullReport(rid) {
   const ffeScore = ffeItems.length ? ffeItems.reduce((s, x) => s + x.percent, 0) / ffeItems.length : 0;
   const ffeGatePassed = ffeScore >= FFE_GATE;
   const bonusUzs = (ffeGatePassed && report.non_reimbursement_ok) ? rawBonusUzs : 0;
+  const quarterBonus = await computeMpQuarterBonus(report.mp_id, report.period_year, quarterOf(report.period_month));
 
   return {
     report, mp: mpRes.rows[0], rm_name: rmRes.rows[0]?.full_name || "—",
     fssItems, targetUsd, actualUsd, achievement, rawBonusUzs, bonusUzs, bonusUsd: bonusUzs / Number(report.fx_rate),
     ffeItems, ffeScore, ffeGatePassed, actionPlan: apRes.rows, conversion: convRes.rows, potential: potRes.rows,
+    comments: commentsRes.rows, quarterBonus,
   };
 }
 
@@ -1065,47 +1251,101 @@ app.get("/api/reports/:id/export/xlsx", auth, async (req, res) => {
   if (!report) return;
   const data = await loadFullReport(rid);
 
+  const NAVY = "FF1F2937", GOLD = "FFE8B04B", GREEN = "FFC6EFCE", GREENFONT = "FF1B5E20", RED = "FFFDE0DF", REDFONT = "FFB71C1C", LIGHT = "FFF7F8FA";
+  const headerFill = { type: "pattern", pattern: "solid", fgColor: { argb: NAVY } };
+  const headerFont = { bold: true, color: { argb: "FFFFFFFF" }, size: 11 };
+  const titleFont = { bold: true, size: 16, color: { argb: NAVY } };
+  const thin = { style: "thin", color: { argb: "FFD9DCE1" } };
+  const border = { top: thin, bottom: thin, left: thin, right: thin };
+
+  function styleHeaderRow(row) {
+    row.eachCell((cell) => { cell.fill = headerFill; cell.font = headerFont; cell.border = border; cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true }; });
+    row.height = 22;
+  }
+  function achievementFill(pct) {
+    if (pct === null || pct === undefined) return null;
+    if (pct >= 0.9) return { type: "pattern", pattern: "solid", fgColor: { argb: GREEN } };
+    if (pct < 0.8) return { type: "pattern", pattern: "solid", fgColor: { argb: RED } };
+    return null;
+  }
+  function achievementFont(pct) {
+    if (pct === null || pct === undefined) return {};
+    if (pct >= 0.9) return { color: { argb: GREENFONT }, bold: true };
+    if (pct < 0.8) return { color: { argb: REDFONT }, bold: true };
+    return {};
+  }
+
   const wb = new ExcelJS.Workbook();
-  const ws1 = wb.addWorksheet("FSS");
-  ws1.addRow([`Медпред: ${data.mp.full_name}`, `Территория: ${data.mp.territory || "—"}`, `РМ: ${data.rm_name}`]);
-  ws1.addRow([`Период: ${data.report.period_month}/${data.report.period_year}`]);
+  wb.creator = "FSS Review Platform";
+
+  const ws1 = wb.addWorksheet("FSS", { views: [{ showGridLines: false }] });
+  ws1.mergeCells("A1:G1");
+  ws1.getCell("A1").value = `Отчёт FSS — ${data.mp.full_name}`;
+  ws1.getCell("A1").font = titleFont;
+  ws1.getCell("A2").value = `Территория: ${data.mp.territory || "—"}   ·   РМ: ${data.rm_name}   ·   Период: ${data.report.period_month}/${data.report.period_year}`;
+  ws1.getCell("A2").font = { italic: true, color: { argb: "FF6B7280" } };
   ws1.addRow([]);
-  ws1.addRow(["Препарат", "NRV $", "План, уп.", "Факт, уп.", "План, $", "Факт, $", "Дост., %"]).font = { bold: true };
+  const h1 = ws1.addRow(["Препарат", "NRV $", "План, уп.", "Факт, уп.", "План, $", "Факт, $", "Дост., %"]);
+  styleHeaderRow(h1);
   data.fssItems.forEach((it) => {
-    ws1.addRow([it.product_name, Number(it.nrv_usd), Number(it.target_qty), Number(it.actual_qty), it.target_usd, it.actual_usd, it.target_usd ? it.actual_usd / it.target_usd : 0]);
+    const pct = it.target_usd ? it.actual_usd / it.target_usd : null;
+    const row = ws1.addRow([it.product_name, Number(it.nrv_usd), Number(it.target_qty), Number(it.actual_qty), it.target_usd, it.actual_usd, pct]);
+    row.getCell(2).numFmt = '$#,##0.00';
+    row.getCell(5).numFmt = '$#,##0'; row.getCell(6).numFmt = '$#,##0'; row.getCell(7).numFmt = '0.0%';
+    row.eachCell((c) => (c.border = border));
+    if (pct !== null) { row.getCell(7).fill = achievementFill(pct); row.getCell(7).font = achievementFont(pct); }
   });
   ws1.addRow([]);
-  ws1.addRow(["ИТОГО", "", "", "", data.targetUsd, data.actualUsd, data.achievement]).font = { bold: true };
+  const totalRow = ws1.addRow(["ИТОГО", "", "", "", data.targetUsd, data.actualUsd, data.achievement]);
+  totalRow.font = { bold: true };
+  totalRow.getCell(5).numFmt = '$#,##0'; totalRow.getCell(6).numFmt = '$#,##0'; totalRow.getCell(7).numFmt = '0.0%';
+  totalRow.getCell(7).fill = achievementFill(data.achievement);
   ws1.addRow([]);
   ws1.addRow(["Расчётный бонус (по FSS), UZS", Math.round(data.rawBonusUzs)]);
-  ws1.addRow(["FFE gate (>=85%)", data.ffeGatePassed ? "пройден" : "НЕ пройден — бонус обнулён"]);
-  ws1.addRow(["Non-reimbursement условие (>=50%)", data.report.non_reimbursement_ok ? "подтверждено" : "НЕ подтверждено — бонус обнулён"]);
-  ws1.addRow(["ИТОГОВЫЙ бонус, UZS", Math.round(data.bonusUzs)]).font = { bold: true };
-  ws1.addRow(["ИТОГОВЫЙ бонус, $", Math.round(data.bonusUsd)]).font = { bold: true };
-  ws1.getColumn(1).width = 30;
+  const ffeGateRow = ws1.addRow(["FFE gate (≥85%)", data.ffeGatePassed ? "пройден ✓" : "НЕ пройден — бонус обнулён"]);
+  ffeGateRow.getCell(2).font = { color: { argb: data.ffeGatePassed ? GREENFONT : REDFONT }, bold: true };
+  const nrRow = ws1.addRow(["Non-reimbursement условие (≥50%)", data.report.non_reimbursement_ok ? "подтверждено ✓" : "НЕ подтверждено — бонус обнулён"]);
+  nrRow.getCell(2).font = { color: { argb: data.report.non_reimbursement_ok ? GREENFONT : REDFONT }, bold: true };
+  const finalBonusRow = ws1.addRow(["ИТОГОВЫЙ бонус, UZS / $", `${Math.round(data.bonusUzs).toLocaleString()} / $${Math.round(data.bonusUsd).toLocaleString()}`]);
+  finalBonusRow.font = { bold: true, size: 12, color: { argb: NAVY } };
+  ws1.getColumn(1).width = 32; ws1.getColumn(2).width = 14; ws1.getColumn(3).width = 12; ws1.getColumn(4).width = 12; ws1.getColumn(5).width = 14; ws1.getColumn(6).width = 14; ws1.getColumn(7).width = 12;
+  ws1.views = [{ state: "frozen", ySplit: 4 }];
 
-  const ws2 = wb.addWorksheet("FFE");
-  ws2.addRow(["Метрика", "База (master list)", "Утверждено", "Достигнуто", "%"]).font = { bold: true };
-  data.ffeItems.forEach((it) => ws2.addRow([it.label, it.master_list_count, it.approved_count, it.achieved_count, it.percent]));
+  const ws2 = wb.addWorksheet("FFE", { views: [{ showGridLines: false }] });
+  const h2 = ws2.addRow(["Метрика", "База", "Утверждено", "Достигнуто", "%"]);
+  styleHeaderRow(h2);
+  data.ffeItems.forEach((it) => {
+    const row = ws2.addRow([it.label, it.master_list_count, it.approved_count, it.achieved_count, it.percent]);
+    row.getCell(5).numFmt = '0.0%';
+    row.eachCell((c) => (c.border = border));
+    row.getCell(5).fill = achievementFill(it.percent); row.getCell(5).font = achievementFont(it.percent);
+  });
   ws2.addRow([]);
-  ws2.addRow(["Общий FFE score", "", "", "", data.ffeScore]).font = { bold: true };
-  ws2.addRow(["Порог допуска к бонусу", "", "", "", 0.85]);
-  ws2.getColumn(1).width = 34;
+  const ffeScoreRow = ws2.addRow(["Общий FFE score", "", "", "", data.ffeScore]);
+  ffeScoreRow.font = { bold: true }; ffeScoreRow.getCell(5).numFmt = '0.0%';
+  ws2.addRow(["Порог допуска к бонусу", "", "", "", 0.85]).getCell(5).numFmt = '0.0%';
+  ws2.getColumn(1).width = 34; [2, 3, 4, 5].forEach((i) => (ws2.getColumn(i).width = 14));
 
-  const ws3 = wb.addWorksheet("Action Plan");
-  ws3.addRow(["Препарат", "Цель", "План действий", "Контрольная дата", "Дата завершения"]).font = { bold: true };
-  data.actionPlan.forEach((it) => ws3.addRow([it.product_name, it.goal, it.action_text, it.control_date, it.completion_date]));
+  const ws3 = wb.addWorksheet("Action Plan", { views: [{ showGridLines: false }] });
+  styleHeaderRow(ws3.addRow(["Препарат", "Цель", "План действий", "Контрольная дата", "Дата завершения"]));
+  data.actionPlan.forEach((it) => { const row = ws3.addRow([it.product_name, it.goal, it.action_text, it.control_date, it.completion_date]); row.eachCell((c) => (c.border = border)); });
   ws3.columns.forEach((c) => (c.width = 28));
 
-  const ws4 = wb.addWorksheet("Конверсия");
-  ws4.addRow(["Препарат", "Врач", "Наш преп., Rx/нед", "Конкуренты, Rx/нед", "Почему конкуренты", "План МП", "Цель, Rx/нед", "Начало", "Контроль"]).font = { bold: true };
-  data.conversion.forEach((it) => ws4.addRow([it.product_name, it.doctor_name, Number(it.current_rx_per_week), Number(it.competitor_rx_per_week), it.competitor_reason, it.mp_action_plan, Number(it.target_rx_per_week), it.start_date, it.control_date]));
-  ws4.columns.forEach((c) => (c.width = 24));
+  const ws4 = wb.addWorksheet("Конверсия", { views: [{ showGridLines: false }] });
+  styleHeaderRow(ws4.addRow(["Препарат", "Врач", "Специальность", "ЛПУ", "Наш преп., Rx/нед", "Конкуренты, Rx/нед", "Почему конкуренты", "План МП", "Цель, Rx/нед", "Начало", "Контроль"]));
+  data.conversion.forEach((it) => {
+    const row = ws4.addRow([it.product_name, it.doctor_name, it.doctor_specialty, it.lpu_name, Number(it.current_rx_per_week), Number(it.competitor_rx_per_week), it.competitor_reason, it.mp_action_plan, Number(it.target_rx_per_week), it.start_date, it.control_date]);
+    row.eachCell((c) => (c.border = border));
+  });
+  ws4.columns.forEach((c) => (c.width = 22));
 
-  const ws5 = wb.addWorksheet("Увеличение потенциала");
-  ws5.addRow(["Препарат", "Врач", "Текущий потенциал, Rx/нед", "Причина", "План МП", "Цель, Rx/нед", "Начало", "Контроль"]).font = { bold: true };
-  data.potential.forEach((it) => ws5.addRow([it.product_name, it.doctor_name, Number(it.current_potential_per_week), it.reason_not_treating, it.mp_action_plan, Number(it.target_rx_per_week), it.start_date, it.control_date]));
-  ws5.columns.forEach((c) => (c.width = 24));
+  const ws5 = wb.addWorksheet("Увеличение потенциала", { views: [{ showGridLines: false }] });
+  styleHeaderRow(ws5.addRow(["Препарат", "Врач", "Специальность", "ЛПУ", "Текущий потенциал, Rx/нед", "Причина", "План МП", "Цель, Rx/нед", "Начало", "Контроль"]));
+  data.potential.forEach((it) => {
+    const row = ws5.addRow([it.product_name, it.doctor_name, it.doctor_specialty, it.lpu_name, Number(it.current_potential_per_week), it.reason_not_treating, it.mp_action_plan, Number(it.target_rx_per_week), it.start_date, it.control_date]);
+    row.eachCell((c) => (c.border = border));
+  });
+  ws5.columns.forEach((c) => (c.width = 22));
 
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", `attachment; filename="report_${rid}.xlsx"`);
@@ -1122,44 +1362,140 @@ app.get("/api/reports/:id/export/pptx", auth, async (req, res) => {
   const pptx = new PptxGenJS();
   pptx.defineLayout({ name: "WIDE", width: 13.33, height: 7.5 });
   pptx.layout = "WIDE";
-  const DARK = "0E1726", GOLD = "E8B04B", GREEN = "3FB88F", TEXT = "F5F0E6";
+  // Light, clean theme
+  const BG = "FFFFFF", INK = "1F2937", MUTED = "6B7280", GOLD = "C58A1F", GREEN = "1B8A5A", RED = "C0392B", PANEL = "F3F4F6", LINE = "E5E7EB";
 
-  // Slide 1 — cover
+  function chrome(s, title) {
+    s.background = { color: BG };
+    s.addText(title, { x: 0.5, y: 0.3, fontSize: 22, bold: true, color: INK, fontFace: "Georgia" });
+    s.addShape(pptx.ShapeType.line, { x: 0.5, y: 0.85, w: 12.3, h: 0, line: { color: GOLD, width: 2 } });
+  }
+  function achColor(pct) { if (pct === null || pct === undefined) return MUTED; return pct >= 0.9 ? GREEN : pct < 0.8 ? RED : GOLD; }
+
+  // ---- Slide 1: cover ----
   let s = pptx.addSlide();
-  s.background = { color: DARK };
-  s.addText("Бизнес-ревью медпредставителя", { x: 0.6, y: 2.4, w: 12, h: 1, fontSize: 32, bold: true, color: TEXT });
-  s.addText(`${data.mp.full_name}  ·  ${data.mp.territory || "—"}  ·  РМ: ${data.rm_name}`, { x: 0.6, y: 3.3, w: 12, h: 0.6, fontSize: 18, color: GOLD });
-  s.addText(`Период: ${data.report.period_month}/${data.report.period_year}`, { x: 0.6, y: 3.9, w: 12, h: 0.5, fontSize: 14, color: TEXT });
+  s.background = { color: BG };
+  s.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 13.33, h: 7.5, fill: { color: PANEL } });
+  s.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: 0.18, h: 7.5, fill: { color: GOLD } });
+  s.addText("Бизнес-ревью медпредставителя", { x: 0.9, y: 2.6, w: 11.5, h: 1, fontSize: 34, bold: true, color: INK, fontFace: "Georgia" });
+  s.addText(`${data.mp.full_name}   ·   ${data.mp.territory || "—"}`, { x: 0.9, y: 3.5, w: 11.5, h: 0.6, fontSize: 18, color: GOLD, bold: true });
+  s.addText(`РМ: ${data.rm_name}   ·   Период: ${data.report.period_month}/${data.report.period_year}`, { x: 0.9, y: 4.05, w: 11.5, h: 0.5, fontSize: 14, color: MUTED });
 
-  // Slide 2 — FSS summary
-  s = pptx.addSlide();
-  s.background = { color: DARK };
-  s.addText("FSS — план vs факт", { x: 0.5, y: 0.4, fontSize: 24, bold: true, color: TEXT });
-  s.addText(`Достижение: ${(data.achievement * 100).toFixed(1)}%`, { x: 0.5, y: 1.1, fontSize: 20, color: data.achievement >= 1 ? GREEN : GOLD });
-  s.addText(`План: $${Math.round(data.targetUsd).toLocaleString()}   Факт: $${Math.round(data.actualUsd).toLocaleString()}`, { x: 0.5, y: 1.7, fontSize: 16, color: TEXT });
-  s.addText(`Бонус: ${Math.round(data.bonusUzs).toLocaleString()} UZS (~$${Math.round(data.bonusUsd).toLocaleString()})`, { x: 0.5, y: 2.2, fontSize: 16, color: GOLD, bold: true });
-  const rows = [["Препарат", "План, уп.", "Факт, уп.", "Дост."]];
-  data.fssItems.slice(0, 12).forEach((it) => rows.push([it.product_name, String(it.target_qty), String(it.actual_qty), it.target_usd ? `${((it.actual_usd / it.target_usd) * 100).toFixed(0)}%` : "—"]));
-  s.addTable(rows, { x: 0.5, y: 2.8, w: 12, fontSize: 11, color: TEXT, border: { color: "3A4A66", pt: 0.5 }, fill: { color: "141F33" } });
-
-  // Slide 3 — FFE
-  s = pptx.addSlide();
-  s.background = { color: DARK };
-  s.addText("FFE — Field Force Effectiveness", { x: 0.5, y: 0.4, fontSize: 24, bold: true, color: TEXT });
-  s.addText(`Общий score: ${(data.ffeScore * 100).toFixed(1)}%  (порог допуска к бонусу: 85%)`, {
-    x: 0.5, y: 1.1, fontSize: 16, color: data.ffeScore >= 0.85 ? GREEN : "E2574C", bold: true,
+  // ---- Slide 2: FSS summary table ----
+  s = pptx.addSlide(); chrome(s, "FSS — план vs факт");
+  s.addText(`Достижение: ${(data.achievement * 100).toFixed(1)}%`, { x: 0.5, y: 1.0, fontSize: 20, bold: true, color: achColor(data.achievement) });
+  s.addText(`План: $${Math.round(data.targetUsd).toLocaleString()}   Факт: $${Math.round(data.actualUsd).toLocaleString()}   Бонус: ${Math.round(data.bonusUzs).toLocaleString()} UZS`, { x: 0.5, y: 1.5, fontSize: 14, color: INK });
+  const fssRows = [[
+    { text: "Препарат", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    { text: "План, уп.", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    { text: "Факт, уп.", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    { text: "Дост.", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+  ]];
+  data.fssItems.slice(0, 14).forEach((it) => {
+    const pct = it.target_usd ? it.actual_usd / it.target_usd : null;
+    const cellFill = pct === null ? PANEL : pct >= 0.9 ? "E8F5EE" : pct < 0.8 ? "FBEAE9" : "FEF6E7";
+    fssRows.push([
+      { text: it.product_name, options: { color: INK, fill: { color: cellFill } } },
+      { text: String(it.target_qty), options: { color: MUTED, fill: { color: cellFill }, align: "right" } },
+      { text: String(it.actual_qty), options: { color: INK, fill: { color: cellFill }, align: "right" } },
+      { text: pct === null ? "—" : `${(pct * 100).toFixed(0)}%`, options: { color: achColor(pct), bold: true, fill: { color: cellFill }, align: "right" } },
+    ]);
   });
-  const ffeRows = [["Метрика", "База", "Утв.", "Достигнуто", "%"]];
-  data.ffeItems.forEach((it) => ffeRows.push([it.label, String(it.master_list_count), String(it.approved_count), String(it.achieved_count), `${(it.percent * 100).toFixed(0)}%`]));
-  s.addTable(ffeRows, { x: 0.5, y: 1.6, w: 12, fontSize: 11, color: TEXT, border: { color: "3A4A66", pt: 0.5 }, fill: { color: "141F33" } });
+  s.addTable(fssRows, { x: 0.5, y: 2.0, w: 8.5, fontSize: 10, border: { color: LINE, pt: 0.5 }, autoPage: false });
+  s.addChart(pptx.ChartType.bar, [
+    { name: "План", labels: data.fssItems.slice(0, 8).map((it) => it.product_name.split(" ").slice(0, 2).join(" ")), values: data.fssItems.slice(0, 8).map((it) => Math.round(it.target_usd)) },
+    { name: "Факт", labels: data.fssItems.slice(0, 8).map((it) => it.product_name.split(" ").slice(0, 2).join(" ")), values: data.fssItems.slice(0, 8).map((it) => Math.round(it.actual_usd)) },
+  ], { x: 9.2, y: 1.0, w: 3.6, h: 5.5, chartColors: [MUTED, GOLD], showLegend: true, legendPos: "b", showValAxisTitle: false, catAxisLabelFontSize: 7, dataLabelFontSize: 7 });
 
-  // Slide 4 — Action plan
-  s = pptx.addSlide();
-  s.background = { color: DARK };
-  s.addText("Action Plan", { x: 0.5, y: 0.4, fontSize: 24, bold: true, color: TEXT });
-  const apRows = [["Препарат", "Цель", "План действий", "Контроль", "Завершение"]];
-  data.actionPlan.forEach((it) => apRows.push([it.product_name || "", it.goal || "", it.action_text || "", it.control_date ? String(it.control_date).slice(0, 10) : "", it.completion_date ? String(it.completion_date).slice(0, 10) : ""]));
-  s.addTable(apRows, { x: 0.5, y: 1.0, w: 12.3, fontSize: 10, color: TEXT, border: { color: "3A4A66", pt: 0.5 }, fill: { color: "141F33" } });
+  // ---- Slide 3: FFE ----
+  s = pptx.addSlide(); chrome(s, "FFE — Field Force Effectiveness");
+  s.addText(`Общий score: ${(data.ffeScore * 100).toFixed(1)}%  (порог для бонуса — 85%)`, { x: 0.5, y: 1.0, fontSize: 16, bold: true, color: data.ffeScore >= 0.85 ? GREEN : RED });
+  const ffeRows = [[
+    { text: "Метрика", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    { text: "База", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    { text: "Утв.", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    { text: "Достигнуто", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    { text: "%", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+  ]];
+  data.ffeItems.forEach((it) => {
+    const cellFill = it.percent >= 0.9 ? "E8F5EE" : it.percent < 0.8 ? "FBEAE9" : "FEF6E7";
+    ffeRows.push([
+      { text: it.label, options: { color: INK, fill: { color: cellFill } } },
+      { text: String(it.master_list_count), options: { color: MUTED, fill: { color: cellFill }, align: "right" } },
+      { text: String(it.approved_count), options: { color: MUTED, fill: { color: cellFill }, align: "right" } },
+      { text: String(it.achieved_count), options: { color: INK, fill: { color: cellFill }, align: "right" } },
+      { text: `${(it.percent * 100).toFixed(0)}%`, options: { color: achColor(it.percent), bold: true, fill: { color: cellFill }, align: "right" } },
+    ]);
+  });
+  s.addTable(ffeRows, { x: 0.5, y: 1.6, w: 12.3, fontSize: 11, border: { color: LINE, pt: 0.5 }, autoPage: false });
+
+  // ---- Slide 4: results & comments (red/green) ----
+  s = pptx.addSlide(); chrome(s, "Итоги: сильные и слабые бренды");
+  const good = data.fssItems.filter((it) => it.target_usd && it.actual_usd / it.target_usd >= 0.9);
+  const bad = data.fssItems.filter((it) => it.target_usd && it.actual_usd / it.target_usd < 0.8);
+  s.addText("✓ Выполнено (≥90%)", { x: 0.5, y: 1.0, fontSize: 14, bold: true, color: GREEN });
+  s.addText(good.length ? good.map((it) => `${it.product_name} — ${((it.actual_usd / it.target_usd) * 100).toFixed(0)}%`).join("\n") : "нет позиций", { x: 0.5, y: 1.4, w: 5.8, h: 4.8, fontSize: 10, color: INK, valign: "top" });
+  s.addText("✗ Не выполнено (<80%)", { x: 6.7, y: 1.0, fontSize: 14, bold: true, color: RED });
+  s.addText(bad.length ? bad.map((it) => `${it.product_name} — ${((it.actual_usd / it.target_usd) * 100).toFixed(0)}%`).join("\n") : "нет позиций", { x: 6.7, y: 1.4, w: 5.8, h: 2.2, fontSize: 10, color: INK, valign: "top" });
+  const badComments = data.comments.filter((c) => c.section === "fss").map((c) => `«${c.comment_text}» — ${c.author_name}`);
+  s.addText("Комментарии по причинам:", { x: 6.7, y: 3.7, fontSize: 11, bold: true, color: INK });
+  s.addText(badComments.length ? badComments.join("\n") : "комментариев пока нет", { x: 6.7, y: 4.1, w: 5.8, h: 2.5, fontSize: 9, color: MUTED, valign: "top" });
+
+  // ---- Slide 5: Конверсия ----
+  if (data.conversion.length > 0) {
+    s = pptx.addSlide(); chrome(s, "План конверсии врачей");
+    const convRows = [[
+      { text: "Препарат", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+      { text: "Врач", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+      { text: "Наш преп.", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+      { text: "Конкур.", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+      { text: "Цель", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    ]];
+    data.conversion.slice(0, 16).forEach((it) => convRows.push([
+      { text: it.product_name, options: { color: INK } }, { text: it.doctor_name, options: { color: INK } },
+      { text: String(it.current_rx_per_week), options: { color: MUTED, align: "right" } },
+      { text: String(it.competitor_rx_per_week), options: { color: RED, align: "right" } },
+      { text: String(it.target_rx_per_week), options: { color: GREEN, bold: true, align: "right" } },
+    ]));
+    s.addTable(convRows, { x: 0.5, y: 1.0, w: 12.3, fontSize: 10, border: { color: LINE, pt: 0.5 }, autoPage: false });
+  }
+
+  // ---- Slide 6: Потенциал ----
+  if (data.potential.length > 0) {
+    s = pptx.addSlide(); chrome(s, "План увеличения потенциала");
+    const potRows = [[
+      { text: "Препарат", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+      { text: "Врач", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+      { text: "Текущий потенциал", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+      { text: "Цель", options: { bold: true, fill: { color: INK }, color: "FFFFFF" } },
+    ]];
+    data.potential.slice(0, 16).forEach((it) => potRows.push([
+      { text: it.product_name, options: { color: INK } }, { text: it.doctor_name, options: { color: INK } },
+      { text: String(it.current_potential_per_week), options: { color: MUTED, align: "right" } },
+      { text: String(it.target_rx_per_week), options: { color: GREEN, bold: true, align: "right" } },
+    ]));
+    s.addTable(potRows, { x: 0.5, y: 1.0, w: 12.3, fontSize: 10, border: { color: LINE, pt: 0.5 }, autoPage: false });
+  }
+
+  // ---- Slide 7: Bonus detail ----
+  s = pptx.addSlide(); chrome(s, "Прогресс по бонусу");
+  const qb = data.quarterBonus;
+  s.addText(`Квартал: Q${qb.quarter} ${qb.year}`, { x: 0.5, y: 1.0, fontSize: 14, color: MUTED });
+  s.addText(`Достижение за квартал: ${(qb.achievement * 100).toFixed(1)}%`, { x: 0.5, y: 1.4, fontSize: 18, bold: true, color: achColor(qb.achievement) });
+  s.addText(`Тариф: ${qb.tier_label}`, { x: 0.5, y: 1.9, fontSize: 13, color: INK });
+  const gapLines = [];
+  if (qb.achievement < 0.9) {
+    const needUsd = Math.round(qb.target_usd * 0.9 - qb.actual_usd);
+    gapLines.push(`Не хватает ~$${needUsd.toLocaleString()} до порога 90% (минимум для начала бонуса)`);
+  }
+  if (!qb.ffe_gate_passed) gapLines.push(`FFE score ${(qb.ffe_score * 100).toFixed(1)}% — нужно ≥85% для допуска к выплате`);
+  if (!qb.non_reimbursement_ok) gapLines.push(`Не подтверждено условие ≥50% non-reimbursement продуктов`);
+  if (!qb.all_months_approved) gapLines.push(`Не все 3 месяца квартала ещё одобрены РМ`);
+  s.addText(gapLines.length ? "Что нужно для получения бонуса:" : "Все условия для бонуса выполнены ✓", { x: 0.5, y: 2.5, fontSize: 13, bold: true, color: gapLines.length ? RED : GREEN });
+  s.addText(gapLines.join("\n"), { x: 0.5, y: 2.9, w: 8, h: 2, fontSize: 11, color: INK, valign: "top" });
+  s.addShape(pptx.ShapeType.rect, { x: 0.5, y: 5.1, w: 6, h: 1.3, fill: { color: PANEL }, line: { color: LINE } });
+  s.addText("ИТОГОВЫЙ БОНУС ЗА КВАРТАЛ", { x: 0.7, y: 5.25, fontSize: 11, color: MUTED });
+  s.addText(`${Math.round(qb.bonus_uzs).toLocaleString()} UZS`, { x: 0.7, y: 5.55, fontSize: 24, bold: true, color: qb.bonus_uzs > 0 ? GOLD : RED });
 
   const buffer = await pptx.write({ outputType: "nodebuffer" });
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.presentationml.presentation");

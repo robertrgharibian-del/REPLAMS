@@ -94,9 +94,11 @@ export default function ReportView({ reportId, user, onBack }) {
     setFieldDays(d.field_days ? Object.fromEntries(Object.entries(d.field_days).map(([k, v]) => [k, typeof v === "number" ? toInputStr(v) : v])) : null);
     setApRows(d.action_plan.map((a) => ({ ...a })));
     setConvRows(d.conversion.items.map((c) => ({ ...c,
-      current_rx_per_week: toInputStr(c.current_rx_per_week), competitor_rx_per_week: toInputStr(c.competitor_rx_per_week), target_rx_per_week: toInputStr(c.target_rx_per_week) })));
+      current_rx_per_week: toInputStr(c.current_rx_per_week), competitor_rx_per_week: toInputStr(c.competitor_rx_per_week), target_rx_per_week: toInputStr(c.target_rx_per_week),
+      actual_result_rx_per_week: toInputStr(c.actual_result_rx_per_week) })));
     setPotRows(d.potential.items.map((c) => ({ ...c,
-      current_potential_per_week: toInputStr(c.current_potential_per_week), target_rx_per_week: toInputStr(c.target_rx_per_week) })));
+      current_potential_per_week: toInputStr(c.current_potential_per_week), target_rx_per_week: toInputStr(c.target_rx_per_week),
+      actual_result_rx_per_week: toInputStr(c.actual_result_rx_per_week) })));
     setFssLocked(d.fss.items.some((i) => Number(i.target_qty) > 0 || Number(i.actual_qty) > 0));
     setFfeLocked(d.ffe.items.some((i) => Number(i.master_list_count) > 0 || Number(i.achieved_count) > 0));
     setConvLocked(d.conversion.items.length > 0);
@@ -165,14 +167,14 @@ export default function ReportView({ reportId, user, onBack }) {
   async function saveConversion() {
     setBusy(true); setError("");
     try {
-      await api.saveConversion(reportId, convRows.map((r) => ({ ...r, current_rx_per_week: toNum(r.current_rx_per_week), competitor_rx_per_week: toNum(r.competitor_rx_per_week), target_rx_per_week: toNum(r.target_rx_per_week) })));
+      await api.saveConversion(reportId, convRows.map((r) => ({ ...r, current_rx_per_week: toNum(r.current_rx_per_week), competitor_rx_per_week: toNum(r.competitor_rx_per_week), target_rx_per_week: toNum(r.target_rx_per_week), actual_result_rx_per_week: r.actual_result_rx_per_week === "" ? null : toNum(r.actual_result_rx_per_week) })));
       await load();
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   }
   async function savePotential() {
     setBusy(true); setError("");
     try {
-      await api.savePotential(reportId, potRows.map((r) => ({ ...r, current_potential_per_week: toNum(r.current_potential_per_week), target_rx_per_week: toNum(r.target_rx_per_week) })));
+      await api.savePotential(reportId, potRows.map((r) => ({ ...r, current_potential_per_week: toNum(r.current_potential_per_week), target_rx_per_week: toNum(r.target_rx_per_week), actual_result_rx_per_week: r.actual_result_rx_per_week === "" ? null : toNum(r.actual_result_rx_per_week) })));
       await load();
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   }
@@ -545,6 +547,25 @@ export default function ReportView({ reportId, user, onBack }) {
                   ) : <div>{row.lpu_name || "—"}</div>}
                 </div>
               </div>
+              {row.previous_target_rx_per_week !== null && row.previous_target_rx_per_week !== undefined && (
+                <div className="grid grid-cols-2 gap-2 text-sm mb-2 rounded-lg p-2" style={{ background: "#0E1726" }}>
+                  <div>
+                    <div className="text-xs mb-1" style={{ color: "#8493AA" }}>План прошлого месяца (зафиксирован)</div>
+                    <div className="font-mono" style={{ color: "#8493AA" }}>{row.previous_target_rx_per_week} Rx/нед</div>
+                  </div>
+                  <div>
+                    <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Факт достигнуто в этом месяце</div>
+                    {convEditable ? <NumField value={row.actual_result_rx_per_week} onChange={(v) => setConvRows((r) => r.map((x, i) => i === idx ? { ...x, actual_result_rx_per_week: v } : x))}
+                      className="w-full border rounded px-2 py-1.5 font-mono" style={inputStyle()} />
+                      : <div className="font-mono">{dispNum(row.actual_result_rx_per_week)}</div>}
+                    {row.actual_result_rx_per_week !== "" && row.actual_result_rx_per_week != null && (
+                      <div className="text-xs mt-1" style={{ color: toNum(row.actual_result_rx_per_week) >= row.previous_target_rx_per_week ? "#3FB88F" : "#E2574C" }}>
+                        {toNum(row.actual_result_rx_per_week) >= row.previous_target_rx_per_week ? "✓ план выполнен" : "✗ план не выполнен"}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
               <div className="grid grid-cols-3 gap-2 text-sm mb-2">
                 <div>
                   <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Наш преп., Rx/нед</div>
@@ -684,6 +705,25 @@ export default function ReportView({ reportId, user, onBack }) {
                   ) : <div>{row.lpu_name || "—"}</div>}
                 </div>
               </div>
+              {row.previous_target_rx_per_week !== null && row.previous_target_rx_per_week !== undefined && (
+                <div className="grid grid-cols-2 gap-2 text-sm mb-2 rounded-lg p-2" style={{ background: "#0E1726" }}>
+                  <div>
+                    <div className="text-xs mb-1" style={{ color: "#8493AA" }}>План прошлого месяца (зафиксирован)</div>
+                    <div className="font-mono" style={{ color: "#8493AA" }}>{row.previous_target_rx_per_week} Rx/нед</div>
+                  </div>
+                  <div>
+                    <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Факт достигнуто в этом месяце</div>
+                    {potEditable ? <NumField value={row.actual_result_rx_per_week} onChange={(v) => setPotRows((r) => r.map((x, i) => i === idx ? { ...x, actual_result_rx_per_week: v } : x))}
+                      className="w-full border rounded px-2 py-1.5 font-mono" style={inputStyle()} />
+                      : <div className="font-mono">{dispNum(row.actual_result_rx_per_week)}</div>}
+                    {row.actual_result_rx_per_week !== "" && row.actual_result_rx_per_week != null && (
+                      <div className="text-xs mt-1" style={{ color: toNum(row.actual_result_rx_per_week) >= row.previous_target_rx_per_week ? "#3FB88F" : "#E2574C" }}>
+                        {toNum(row.actual_result_rx_per_week) >= row.previous_target_rx_per_week ? "✓ план выполнен" : "✗ план не выполнен"}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-2 text-sm mb-2">
                 <div>
                   <div className="text-xs mb-1" style={{ color: "#8493AA" }}>Текущий потенциал, Rx/нед</div>

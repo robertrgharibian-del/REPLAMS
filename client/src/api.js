@@ -19,6 +19,8 @@ async function request(path, { method = "GET", body, raw } = {}) {
 
 export const api = {
   login: (email, password) => request("/api/auth/login", { method: "POST", body: { email, password } }),
+  requestReset: (email) => request("/api/auth/request-reset", { method: "POST", body: { email } }),
+  updateMe: (payload) => request("/api/auth/me", { method: "PUT", body: payload }),
   me: () => request("/api/auth/me"),
 
   listUsers: () => request("/api/users"),
@@ -52,6 +54,11 @@ export const api = {
   allComments: () => request("/api/comments/all"),
   aiInsightsStatus: () => request("/api/ai-insights/status"),
   aiInsights: (refresh) => request(`/api/ai-insights${refresh ? "?refresh=true" : ""}`),
+  dashboard: () => request("/api/dashboard"),
+  importHistory: () => request("/api/import/history"),
+  undoImport: (id) => request(`/api/import/${id}/undo`, { method: "POST" }),
+  passwordResets: () => request("/api/password-resets"),
+  resolveReset: (userId, password) => request(`/api/users/${userId}`, { method: "PATCH", body: { password } }),
 
   exportUrl: (id, type) => `${BASE}/api/reports/${id}/export/${type}`,
 

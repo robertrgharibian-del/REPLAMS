@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { api } from "../api.js";
 
 const MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
@@ -32,6 +32,48 @@ function ResultBox({ result }) {
   );
 }
 
+function ImportHistory({ refreshKey }) {
+  const [history, setHistory] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+
+  async function load() { setHistory(await api.importHistory()); }
+  useEffect(() => { load(); }, [refreshKey]);
+
+  async function undo(id) {
+    if (!confirm("Отменить эту загрузку? Значения вернутся к тем, что были до неё.")) return;
+    setBusyId(id);
+    try { await api.undoImport(id); await load(); }
+    catch (e) { alert(e.message); }
+    finally { setBusyId(null); }
+  }
+
+  if (!history) return null;
+  return (
+    <div className="rounded-2xl p-4 sm:p-5" style={{ background: "#141F33", border: "1px solid #22304A" }}>
+      <div className="font-display text-lg mb-3">История загрузок</div>
+      {history.length === 0 && <div className="text-sm" style={{ color: "#8493AA" }}>Загрузок пока не было</div>}
+      <div className="space-y-2">
+        {history.map((h) => (
+          <div key={h.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg p-3 text-sm" style={{ background: "#1B2A44", opacity: h.reverted ? 0.5 : 1 }}>
+            <div>
+              <b>{h.import_type === "fss" ? "FSS продажи" : "Таргеты"}</b>
+              {" "}· {h.import_type === "fss" ? `${h.period_month}/${h.period_year}` : `FY${h.period_year - 1999}`}
+              {" "}· {h.uploaded_by_name} · {new Date(h.created_at).toLocaleString("ru-RU")}
+              {h.reverted && <span style={{ color: "#E2574C" }}> · отменено</span>}
+              <div style={{ color: "#8493AA" }}>Обновлено МП: {h.summary?.mp_updated ?? "—"}</div>
+            </div>
+            {!h.reverted && (
+              <button onClick={() => undo(h.id)} disabled={busyId === h.id} className="px-3 py-1.5 rounded text-xs" style={{ background: "#E2574C22", color: "#E2574C" }}>
+                Отменить загрузку
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function MasterImports() {
   const now = new Date();
   const [fssYear, setFssYear] = useState(now.getFullYear());
@@ -46,17 +88,18 @@ export default function MasterImports() {
   const [tgtBusy, setTgtBusy] = useState(false);
   const [tgtResult, setTgtResult] = useState(null);
   const [tgtError, setTgtError] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
 
   async function uploadFss() {
     if (!fssFile) { setFssError("Выберите файл"); return; }
     setFssBusy(true); setFssError(""); setFssResult(null);
-    try { setFssResult(await api.importFss(fssFile, fssYear, fssMonth)); }
+    try { setFssResult(await api.importFss(fssFile, fssYear, fssMonth)); setRefreshKey((k) => k + 1); }
     catch (e) { setFssError(e.message); } finally { setFssBusy(false); }
   }
   async function uploadTargets() {
     if (!tgtFile) { setTgtError("Выберите файл"); return; }
     setTgtBusy(true); setTgtError(""); setTgtResult(null);
-    try { setTgtResult(await api.importTargets(tgtFile, fy)); }
+    try { setTgtResult(await api.importTargets(tgtFile, fy)); setRefreshKey((k) => k + 1); }
     catch (e) { setTgtError(e.message); } finally { setTgtBusy(false); }
   }
 
@@ -110,6 +153,8 @@ export default function MasterImports() {
         {tgtError && <div className="text-sm mt-3" style={{ color: "#E2574C" }}>{tgtError}</div>}
         <ResultBox result={tgtResult} />
       </div>
+
+      <ImportHistory refreshKey={refreshKey} />
     </div>
   );
 }

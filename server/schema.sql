@@ -145,6 +145,22 @@ create table if not exists ai_insights (
 );
 create index if not exists idx_ai_insights_scope on ai_insights(scope, scope_id, created_at desc);
 
+-- migration 006 (kept in sync here for fresh installs — see migration_006.sql for existing DBs)
+create table if not exists password_reset_requests (
+  id           bigserial primary key,
+  user_id      bigint not null references users(id) on delete cascade,
+  status       text not null default 'pending' check (status in ('pending','resolved')),
+  requested_at timestamptz not null default now(),
+  resolved_at  timestamptz
+);
+create index if not exists idx_pw_reset_status on password_reset_requests(status);
+alter table import_log add column if not exists changes jsonb;
+alter table import_log add column if not exists reverted boolean not null default false;
+alter table report_conversion add column if not exists previous_target_rx_per_week numeric(10,2);
+alter table report_conversion add column if not exists actual_result_rx_per_week numeric(10,2);
+alter table report_potential add column if not exists previous_target_rx_per_week numeric(10,2);
+alter table report_potential add column if not exists actual_result_rx_per_week numeric(10,2);
+
 -- ============================================================
 -- SEED: product catalog (FY'27, MSN Rhythm + Prime)
 -- ============================================================

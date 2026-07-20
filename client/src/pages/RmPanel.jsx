@@ -29,7 +29,7 @@ export default function RmPanel({ user }) {
       <div className="font-display text-2xl font-semibold mb-1">Отчёты моей команды</div>
       <div className="text-sm mb-6" style={{ color: "#8493AA" }}>Медпреды, прикреплённые к вам</div>
       {loading ? <div>Загрузка…</div> : (
-        <div className="rounded-2xl overflow-hidden" style={{ border: "1px solid #22304A" }}>
+        <div className="rounded-2xl overflow-x-auto" style={{ border: "1px solid #22304A" }}>
           <table className="w-full text-sm">
             <thead>
               <tr style={{ background: "#141F33", color: "#8493AA" }} className="uppercase text-xs">

@@ -8,14 +8,16 @@ import MasterUsers from "./pages/MasterUsers.jsx";
 import MasterImports from "./pages/MasterImports.jsx";
 import AllComments from "./pages/AllComments.jsx";
 import AiInsights from "./pages/AiInsights.jsx";
+import Dashboard from "./pages/Dashboard.jsx";
+import Profile from "./pages/Profile.jsx";
 import RmBonusView from "./components/RmBonusView.jsx";
 
 const ROLE_LABEL = { master: "Мастер-аккаунт", rm: "Региональный менеджер", mp: "Медпредставитель" };
 
 const NAV = {
-  master: [["reports", "Отчёты"], ["users", "Пользователи"], ["imports", "Загрузка данных"], ["comments", "Комментарии"], ["ai", "ИИ-рекомендации"]],
-  rm: [["team", "Команда"], ["bonus", "Мой бонус"], ["ai", "ИИ-рекомендации"]],
-  mp: [["report", "Мой отчёт"], ["ai", "ИИ-рекомендации"]],
+  master: [["reports", "Отчёты"], ["users", "Пользователи"], ["imports", "Загрузка данных"], ["comments", "Комментарии"], ["dashboard", "Дашборд"], ["ai", "ИИ-рекомендации"], ["profile", "Профиль"]],
+  rm: [["team", "Команда"], ["bonus", "Мой бонус"], ["dashboard", "Дашборд"], ["ai", "ИИ-рекомендации"], ["profile", "Профиль"]],
+  mp: [["report", "Мой отчёт"], ["ai", "ИИ-рекомендации"], ["profile", "Профиль"]],
 };
 const DEFAULT_SECTION = { master: "reports", rm: "team", mp: "report" };
 
@@ -73,14 +75,19 @@ export default function App() {
       {user.role === "master" && section === "users" && <MasterUsers />}
       {user.role === "master" && section === "imports" && <MasterImports />}
       {user.role === "master" && section === "comments" && <AllComments />}
+      {user.role === "master" && section === "dashboard" && <Dashboard role="master" />}
       {user.role === "master" && section === "ai" && <AiInsights />}
+      {user.role === "master" && section === "profile" && <Profile user={user} onUpdated={setUser} />}
 
       {user.role === "rm" && section === "team" && <RmPanel user={user} />}
       {user.role === "rm" && section === "bonus" && <RmBonusView rmId={user.id} rmName={null} />}
+      {user.role === "rm" && section === "dashboard" && <Dashboard role="rm" />}
       {user.role === "rm" && section === "ai" && <AiInsights />}
+      {user.role === "rm" && section === "profile" && <Profile user={user} onUpdated={setUser} />}
 
       {user.role === "mp" && section === "report" && <MpPanel user={user} />}
       {user.role === "mp" && section === "ai" && <AiInsights />}
+      {user.role === "mp" && section === "profile" && <Profile user={user} onUpdated={setUser} />}
     </div>
   );
 }
