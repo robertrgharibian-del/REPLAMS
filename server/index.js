@@ -13,6 +13,7 @@ const multer = require("multer");
 const cron = require("node-cron");
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 const { TERRITORIES, parseFssWorkbook, parseTargetsWorkbook, monthToCalendarYear } = require("./import.js");
+const { aiEnabled, AI_MODEL, buildAnalyticsContext, callClaude } = require("./ai.js");
 
 const app = express();
 app.use(cors({ origin: process.env.CLIENT_URL || "*" }));
@@ -159,6 +160,7 @@ async function canAccessReport(user, report) {
   if (user.role === "master") return true;
   if (user.role === "mp") return report.mp_id === user.id;
   if (user.role === "rm") {
+    if (report.status === "draft") return false;
     const r = await pool.query("select rm_id from users where id = $1", [report.mp_id]);
     return r.rows[0] && r.rows[0].rm_id === user.id;
   }
@@ -372,6 +374,7 @@ app.get("/api/reports", auth, async (req, res) => {
   } else if (req.user.role === "rm") {
     where.push(`mp.rm_id = $${i++}`);
     values.push(req.user.id);
+    where.push(`r.status != 'draft'`); // RM only sees reports the MP has actually submitted for review
   } // master: no restriction
 
   if (year) { where.push(`r.period_year = $${i++}`); values.push(year); }
@@ -625,9 +628,9 @@ app.put("/api/reports/:id/conversion", auth, requireRole("mp"), async (req, res)
   for (const it of items || []) {
     await pool.query(
       `insert into report_conversion
-       (report_id, product_id, doctor_name, current_rx_per_week, competitor_rx_per_week, competitor_reason, mp_action_plan, target_rx_per_week, start_date, control_date)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [rid, it.product_id, it.doctor_name || "", it.current_rx_per_week || 0, it.competitor_rx_per_week || 0,
+       (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_rx_per_week, competitor_rx_per_week, competitor_reason, mp_action_plan, target_rx_per_week, start_date, control_date)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [rid, it.product_id, it.doctor_name || "", it.doctor_specialty || "", it.lpu_name || "", it.current_rx_per_week || 0, it.competitor_rx_per_week || 0,
        it.competitor_reason || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.start_date || null, it.control_date || null]
     );
   }
@@ -646,9 +649,9 @@ app.put("/api/reports/:id/potential", auth, requireRole("mp"), async (req, res) 
   for (const it of items || []) {
     await pool.query(
       `insert into report_potential
-       (report_id, product_id, doctor_name, current_potential_per_week, reason_not_treating, mp_action_plan, target_rx_per_week, start_date, control_date)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [rid, it.product_id, it.doctor_name || "", it.current_potential_per_week || 0,
+       (report_id, product_id, doctor_name, doctor_specialty, lpu_name, current_potential_per_week, reason_not_treating, mp_action_plan, target_rx_per_week, start_date, control_date)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [rid, it.product_id, it.doctor_name || "", it.doctor_specialty || "", it.lpu_name || "", it.current_potential_per_week || 0,
        it.reason_not_treating || "", it.mp_action_plan || "", it.target_rx_per_week || 0, it.start_date || null, it.control_date || null]
     );
   }
@@ -711,13 +714,14 @@ app.put("/api/reports/:id/settings", auth, async (req, res) => {
   if (!report) return res.status(404).json({ error: "Не найдено" });
   if (!(await canAccessReport(req.user, report))) return res.status(403).json({ error: "Forbidden" });
   if (req.user.role === "mp" && !assertEditable(report, res)) return;
-  const { base_rate_uzs, fx_rate, non_reimbursement_ok } = req.body;
+  const { base_rate_uzs, fx_rate, non_reimbursement_ok, underperformance_note } = req.body;
   if (non_reimbursement_ok !== undefined && req.user.role === "mp") {
     return res.status(403).json({ error: "Только РМ или мастер может подтверждать условие non-reimbursement" });
   }
   await pool.query(
-    "update reports set base_rate_uzs=coalesce($1,base_rate_uzs), fx_rate=coalesce($2,fx_rate), non_reimbursement_ok=coalesce($3,non_reimbursement_ok) where id=$4",
-    [base_rate_uzs, fx_rate, non_reimbursement_ok, rid]
+    `update reports set base_rate_uzs=coalesce($1,base_rate_uzs), fx_rate=coalesce($2,fx_rate),
+     non_reimbursement_ok=coalesce($3,non_reimbursement_ok), underperformance_note=coalesce($4,underperformance_note) where id=$5`,
+    [base_rate_uzs, fx_rate, non_reimbursement_ok, underperformance_note, rid]
   );
   res.json({ ok: true });
 });
@@ -777,7 +781,7 @@ app.post("/api/reports/:id/approve-rm", auth, requireRole("rm"), async (req, res
   res.json({ ok: true });
 });
 
-app.post("/api/reports/:id/comment", auth, requireRole("rm", "master"), async (req, res) => {
+app.post("/api/reports/:id/comment", auth, requireRole("rm", "master", "mp"), async (req, res) => {
   const rid = req.params.id;
   const rRes = await pool.query("select * from reports where id=$1", [rid]);
   const report = rRes.rows[0];
@@ -933,6 +937,70 @@ app.get("/api/rm-bonus", auth, async (req, res) => {
     multiplier, multiplier_label: rmMultiplierLabel(rmAchievement),
     avg_mr_bonus_uzs: avgMrBonus, rm_bonus_uzs: rmBonusUzs,
   });
+});
+
+/* ============================================================
+   AI INSIGHTS — deep month/quarter/year analysis, runs server-side.
+   Requires ANTHROPIC_API_KEY (set once by the company, not per-user).
+   ============================================================ */
+app.get("/api/ai-insights/status", auth, async (req, res) => {
+  res.json({ enabled: aiEnabled, model: aiEnabled ? AI_MODEL : null });
+});
+
+const AI_CACHE_HOURS = 24;
+
+app.get("/api/ai-insights", auth, async (req, res) => {
+  if (!aiEnabled) return res.status(503).json({ error: "ИИ-анализ не настроен на сервере (нет ANTHROPIC_API_KEY)" });
+  const refresh = req.query.refresh === "true";
+  let scope, scopeId, mpIds, label;
+
+  if (req.user.role === "mp") {
+    scope = "mp"; scopeId = req.user.id; mpIds = [req.user.id];
+    const u = await pool.query("select full_name from users where id=$1", [req.user.id]);
+    label = `МП ${u.rows[0]?.full_name || ""}`;
+  } else if (req.user.role === "rm") {
+    scope = "rm"; scopeId = req.user.id;
+    const team = await pool.query("select id from users where rm_id=$1 and role='mp'", [req.user.id]);
+    mpIds = team.rows.map((r) => r.id);
+    label = "Команда РМ";
+  } else if (req.user.role === "master") {
+    scope = "master"; scopeId = null;
+    const all = await pool.query("select id from users where role='mp'");
+    mpIds = all.rows.map((r) => r.id);
+    label = "Вся компания";
+  } else {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (!refresh) {
+    const cacheRes = await pool.query(
+      `select * from ai_insights where scope=$1 and scope_id ${scopeId === null ? "is null" : "=$2"} order by created_at desc limit 1`,
+      scopeId === null ? [scope] : [scope, scopeId]
+    );
+    const cached = cacheRes.rows[0];
+    if (cached && (Date.now() - new Date(cached.created_at).getTime()) < AI_CACHE_HOURS * 3600 * 1000) {
+      return res.json({ ...cached.content, generated_at: cached.created_at, cached: true });
+    }
+  }
+
+  const context = await buildAnalyticsContext(pool, { mpIds, label });
+  if (!context || context.months.length === 0) {
+    return res.json({ summary: "Недостаточно данных для анализа — нет ни одного одобренного отчёта.", monthly_dynamics: "", quarterly_dynamics: "", yearly_dynamics: "", risks: [], short_term_recommendations: [], long_term_recommendations: [], generated_at: new Date(), cached: false });
+  }
+
+  let content;
+  try {
+    content = await callClaude(context);
+  } catch (e) {
+    console.error("AI insights error:", e.message);
+    return res.status(502).json({ error: "Не удалось получить анализ от ИИ. Попробуйте позже." });
+  }
+
+  await pool.query(
+    "insert into ai_insights (scope, scope_id, content, model) values ($1,$2,$3,$4)",
+    [scope, scopeId, content, AI_MODEL]
+  );
+  res.json({ ...content, generated_at: new Date(), cached: false });
 });
 
 /* ============================================================

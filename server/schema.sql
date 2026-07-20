@@ -127,6 +127,24 @@ create index if not exists idx_comments_report on report_comments(report_id);
 alter table reports add column if not exists non_reimbursement_ok boolean not null default true;
 create index if not exists idx_reports_period on reports(period_year, period_month);
 
+-- migration 004 (kept in sync here for fresh installs — see migration_004.sql for existing DBs)
+alter table report_conversion add column if not exists doctor_specialty text;
+alter table report_conversion add column if not exists lpu_name text;
+alter table report_potential add column if not exists doctor_specialty text;
+alter table report_potential add column if not exists lpu_name text;
+alter table reports add column if not exists underperformance_note text;
+
+-- migration 005 (kept in sync here for fresh installs — see migration_005.sql for existing DBs)
+create table if not exists ai_insights (
+  id          bigserial primary key,
+  scope       text not null check (scope in ('mp','rm','master')),
+  scope_id    bigint,
+  content     jsonb not null,
+  model       text,
+  created_at  timestamptz not null default now()
+);
+create index if not exists idx_ai_insights_scope on ai_insights(scope, scope_id, created_at desc);
+
 -- ============================================================
 -- SEED: product catalog (FY'27, MSN Rhythm + Prime)
 -- ============================================================

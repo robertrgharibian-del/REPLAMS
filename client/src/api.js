@@ -50,6 +50,8 @@ export const api = {
   mpBonus: (mpId, year, quarter) => request(`/api/mp-bonus/${mpId}?year=${year}&quarter=${quarter}`),
   rmBonus: (year, quarter, rmId) => request(`/api/rm-bonus?year=${year}&quarter=${quarter}${rmId ? `&rm_id=${rmId}` : ""}`),
   allComments: () => request("/api/comments/all"),
+  aiInsightsStatus: () => request("/api/ai-insights/status"),
+  aiInsights: (refresh) => request(`/api/ai-insights${refresh ? "?refresh=true" : ""}`),
 
   exportUrl: (id, type) => `${BASE}/api/reports/${id}/export/${type}`,
 
